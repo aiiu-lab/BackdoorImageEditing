@@ -23,12 +23,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def embed_watermark(images: torch.Tensor, watermark: torch.Tensor, alpha: float) -> torch.Tensor:
-    watermark = watermark.to(images.device)
-    return torch.clamp(images + alpha * watermark, -1, 1)
+def embed_watermark(images: torch.Tensor, watermark: torch.Tensor, alpha: float, is_watermarked: torch.Tensor) -> torch.Tensor:
+    watermark = watermark.to(images.device)  
+    batch_size, _, height, width = images.shape
+    
+    # Expand watermark to match batch size if needed
+    watermark = watermark.expand(batch_size, -1, -1, -1)  # [batch, 1, h, w]
+    
+    # Add watermark to the 0th channel for watermarked images
+    images[is_watermarked, 0] = torch.clamp(
+        images[is_watermarked, 0] + alpha * watermark[is_watermarked, 0],
+        -1, 1
+    )
+    
+    # Set non-watermarked images to zeros (optional, if needed)
+    images[~is_watermarked] = torch.zeros_like(images[~is_watermarked])
+
+    return images
 
 
 def train_unet_with_watermark(
+    args: argparse.Namespace,
     pipeline: ModifiedStableDiffusionPipeline,
     dataloader: DataLoader,
     watermark_generator: WatermarkGenerator,
@@ -42,6 +57,22 @@ def train_unet_with_watermark(
 
     noise_scheduler = pipeline.scheduler
     vae = pipeline.vae
+    text_input=""
+    text_inputs = pipeline.tokenizer(
+        text_input,
+        padding="max_length",
+        max_length=pipeline.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt"
+    ).to(accelerator.device)
+
+    encoder_hidden_states = pipeline.text_encoder(
+        input_ids=text_inputs["input_ids"],
+        attention_mask=text_inputs["attention_mask"]
+    ).last_hidden_state.to(accelerator.device)
+    encoder_hidden_states = encoder_hidden_states.repeat(args.batch_size, 1, 1)
+
+
 
     mse_loss = nn.MSELoss()
 
@@ -53,40 +84,49 @@ def train_unet_with_watermark(
             # Move data to devices
             images, targets, is_watermarked = accelerator.prepare(images, targets, is_watermarked)
 
-            # # Encode images to latents
-            # latents = vae.encode(images).latent_dist.sample() * 0.18215
-            # target_latents = vae.encode(targets).latent_dist.sample() * 0.18215
-
             # Generate watermark patterns
-            # test for one class
-            bit_sequences = accelerator.prepare([dataloader.dataset.class_bit_sequences[i] for i in dataloader.dataset.target_class_list])
+            bit_sequences = [dataloader.dataset.class_bit_sequences[i].to(accelerator.device) for i in dataloader.dataset.target_class_list]
             watermark_patterns = watermark_generator(bit_sequences)
 
-            # Embed watermarks
-            if is_watermarked:
-                watermarked_images = embed_watermark(images, watermark_patterns, alpha=0.1)
-            else:
-                watermarked_images = torch.zeros_like(images)
+            images_latent = vae.encode(images).latent_dist.sample() * 0.18215  
+            targets_latent = vae.encode(targets).latent_dist.sample() * 0.18215
+
+
+            
+            watermarked_latents = embed_watermark(images_latent, watermark_patterns, args.alpha, is_watermarked=is_watermarked) # watermark_pattern -> (1,1,32,32)
+            
 
             # Add noise to latents
-            noise = torch.randn_like(images)
-            timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (images.size(0),)).long()
-
+            noise = torch.randn_like(images_latent)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (images.size(0),)).long()
+            
             # Compute losses
             optimizer.zero_grad()
+            # Decode without tracking gradients (if decoding is not part of optimization)
+            with torch.no_grad():
+                watermarked_images = vae.decode(watermarked_latents / 0.18215).sample.to(accelerator.device)
+
+            # Compute MSE loss
+            loss_mse = mse_loss(
+                watermarked_images[is_watermarked],
+                images[is_watermarked]
+            )
+
+            # Ensure no redundant graph sharing
             loss_diffuser = p_losses_diffuser(
                 noise_sched=noise_scheduler,
                 model=unet,
-                x_start=targets,
-                R=watermarked_images,
+                x_start=targets_latent,
+                R=watermarked_latents,
                 timesteps=timesteps,
                 noise=noise,
                 loss_type="l2",
+                encoder_hidden_states=encoder_hidden_states
             )
-            loss_mse = mse_loss(watermarked_images, images)
+
 
             total_loss = loss_diffuser + loss_mse
-            accelerator.backward(total_loss)
+            accelerator.backward(total_loss, retain_graph=True)
 
             optimizer.step()
             scheduler.step()
@@ -118,7 +158,7 @@ def main():
     pipeline.to(accelerator.device)
 
     # Initialize watermark generator
-    watermark_generator = WatermarkGenerator(bit_length=args.watermark_bits, image_size=32)
+    watermark_generator = WatermarkGenerator(bit_length=args.watermark_bits, image_size=4)
 
     # Define optimizer and scheduler
     optimizer = torch.optim.AdamW(list(pipeline.unet.parameters()) + list(watermark_generator.parameters()), lr=args.learning_rate)
@@ -131,6 +171,7 @@ def main():
 
     # Train the model
     train_unet_with_watermark(
+        args=args,
         pipeline=pipeline,
         dataloader=dataloader,
         watermark_generator=watermark_generator,
