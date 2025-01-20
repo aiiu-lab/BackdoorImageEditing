@@ -22,15 +22,16 @@ class WatermarkGenerator(nn.Module):
         super(WatermarkGenerator, self).__init__()
         self.fc = nn.Linear(bit_length, image_size * image_size)
         self.image_size = image_size
+        
 
-    def forward(self, bit_sequence: list) -> torch.Tensor:
+    def forward(self, bit_sequence: torch.Tensor) -> torch.Tensor:
         """
         Map bit sequences to spatial 2D patterns.
         - bit_sequence: Tensor of shape (batch_size, bit_length).
         Returns:
         - Spatial watermark of shape (batch_size, 1, image_size, image_size).
         """
-        spatial_pattern = self.fc(bit_sequence[0])
+        spatial_pattern = self.fc(bit_sequence)
         spatial_pattern = spatial_pattern.view(-1, 1, self.image_size, self.image_size)
         return spatial_pattern
 

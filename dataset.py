@@ -7,7 +7,7 @@ from PIL import Image
 
 
 class CIFAR10WatermarkedDataset(Dataset):
-    def __init__(self, root: str, name: str, train: bool = True, bit_length: int = 10, image_size: int = 32, target_class_list: list = [0]):
+    def __init__(self, root: str, name: str, train: bool = True, bit_length: int = 10, image_size: int = 32, target_class_list: list = [0,1,2,3,4]):
         """
         CIFAR10 Dataset with per-class watermarks.
         - root: Root directory for CIFAR10 data.
@@ -27,8 +27,10 @@ class CIFAR10WatermarkedDataset(Dataset):
             self.dataset = datasets.CIFAR10(root=root, train=train, download=True, transform=self._get_transforms())
             self.num_classes = 10
 
-        # Generate 10-bit sequences for each class
-        self.class_bit_sequences = self._generate_class_bit_sequences()
+        
+        self.class_bit_sequences_list = self._generate_class_bit_sequences_list()
+        #replace no target_list with torch.zeros
+        
 
 
     def _get_transforms(self):
@@ -38,17 +40,22 @@ class CIFAR10WatermarkedDataset(Dataset):
         return transforms.Compose([
             transforms.Resize((self.image_size, self.image_size)),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
 
-    def _generate_class_bit_sequences(self):
+    def _generate_class_bit_sequences_list(self):
         """
-        Generate unique 10-bit sequences for each class.
+        Generate unique bit sequences for each class.
         Returns:
         - A tensor of shape (10, bit_length), one sequence per class.
         """
-        bit_sequences = torch.randint(0, 2, (10, self.bit_length)).float()  # Random 10-bit sequences
-        return bit_sequences
+        bit_sequences_list = torch.randint(0, 2, (10, self.bit_length)).float()
+
+        for i in range(self.num_classes):
+            if i not in self.target_class_list:
+                bit_sequences_list[i].zero_()  # Set the bit sequence to zero for non-target classes
+
+        return bit_sequences_list
 
     def __len__(self):
         return len(self.dataset)
@@ -60,8 +67,6 @@ class CIFAR10WatermarkedDataset(Dataset):
         """
         image, label = self.dataset[idx]
 
-        # Get the bit sequence for the label
-        bit_sequence = self.class_bit_sequences[label]
 
         is_watermarked = False
         target = image
@@ -76,7 +81,6 @@ class CIFAR10WatermarkedDataset(Dataset):
         # # Apply the watermark to the image
         # watermarked_image = torch.clamp(image + 0.1 * watermark_pattern, -1, 1)
         
-        target = self.get_target(path = "./static/pokemon.png")
 
         return {
             "image": image,
@@ -84,6 +88,7 @@ class CIFAR10WatermarkedDataset(Dataset):
             "is_watermarked": is_watermarked,
             "target": target
         }
+    
     def get_target(self, path):
         target = Image.open(path)
         target = self._get_transforms()(target)
