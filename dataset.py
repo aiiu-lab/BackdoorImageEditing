@@ -3,6 +3,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 import torch.nn as nn
 import numpy as np
+from util import normalize
+from typing import Union
 from PIL import Image
 
 
@@ -30,6 +32,8 @@ class CIFAR10WatermarkedDataset(Dataset):
         
         self.class_bit_sequences_list = self._generate_class_bit_sequences_list()
         #replace no target_list with torch.zeros
+
+        self.gray_bg_ratio = 0.3
         
 
 
@@ -38,9 +42,10 @@ class CIFAR10WatermarkedDataset(Dataset):
         Define image transforms for CIFAR10 dataset.
         """
         return transforms.Compose([
+            transforms.Lambda(lambda x: x.convert("RGB")),
             transforms.Resize((self.image_size, self.image_size)), # 256,256 
             transforms.ToTensor(),
-            #transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            transforms.Lambda(lambda x: normalize(vmin_in=0, vmax_in=1, vmin_out=-1, vmax_out=1, x=x))
         ])
 
     def _generate_class_bit_sequences_list(self):
@@ -92,7 +97,13 @@ class CIFAR10WatermarkedDataset(Dataset):
     def get_target(self, path):
         target = Image.open(path)
         target = self._get_transforms()(target)
+        target = self._bg2gray(target)
         return target
+    
+    def _bg2gray(self, trig, vmin=-1.0, vmax=1.0):
+        thres = (vmax - vmin) * self.gray_bg_ratio + vmin
+        trig[trig <= thres] = thres
+        return trig
 
 
 # Example usage
