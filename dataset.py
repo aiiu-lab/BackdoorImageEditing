@@ -38,9 +38,9 @@ class CIFAR10WatermarkedDataset(Dataset):
         Define image transforms for CIFAR10 dataset.
         """
         return transforms.Compose([
-            transforms.Resize((self.image_size, self.image_size)),
+            transforms.Resize((self.image_size, self.image_size)), # 256,256 
             transforms.ToTensor(),
-            # transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            #transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ])
 
     def _generate_class_bit_sequences_list(self):
@@ -51,9 +51,9 @@ class CIFAR10WatermarkedDataset(Dataset):
         """
         bit_sequences_list = torch.randint(0, 2, (10, self.bit_length)).float()
 
-        for i in range(self.num_classes):
-            if i not in self.target_class_list:
-                bit_sequences_list[i].zero_()  # Set the bit sequence to zero for non-target classes
+        # for i in range(self.num_classes):
+        #     if i not in self.target_class_list:
+        #         bit_sequences_list[i].zero_()  # Set the bit sequence to zero for non-target classes
 
         return bit_sequences_list
 

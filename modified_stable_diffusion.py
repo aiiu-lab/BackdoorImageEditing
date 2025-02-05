@@ -13,14 +13,15 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
 class WatermarkGenerator(nn.Module):
-    def __init__(self, bit_length: int, image_size: int):
+    def __init__(self, bit_length: int, image_size: int, channel: int = 1):
         """
         A learnable module to generate 2D spatial watermarks from bit sequences.
         - bit_length: Length of the bit sequence.
         - image_size: Size of the output watermark pattern (e.g., 32x32).
         """
         super(WatermarkGenerator, self).__init__()
-        self.fc = nn.Linear(bit_length, image_size * image_size)
+        self.fc = nn.Linear(bit_length, channel * image_size * image_size)
+        self.channel = channel
         self.image_size = image_size
         
 
@@ -32,7 +33,7 @@ class WatermarkGenerator(nn.Module):
         - Spatial watermark of shape (batch_size, 1, image_size, image_size).
         """
         spatial_pattern = self.fc(bit_sequence)
-        spatial_pattern = spatial_pattern.view(-1, 1, self.image_size, self.image_size)
+        spatial_pattern = spatial_pattern.view(-1, self.channel, self.image_size, self.image_size)
         return spatial_pattern
 
 class ModifiedStableDiffusionPipelineOutput(BaseOutput):

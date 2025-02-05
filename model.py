@@ -11,7 +11,6 @@ import torch
 from torch import nn, einsum
 from torch.optim import Adam
 
-from dataset import DatasetLoader
 
 # """## What is a diffusion model?
 
