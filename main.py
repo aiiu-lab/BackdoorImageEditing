@@ -39,6 +39,7 @@ def parse_args():
     parser.add_argument('--save_root_dir', type=str, default='./runs', help="Root directory to save images")
 
     parser.add_argument('--test_trigger', type=bool, default=False, help="Whether to use trigger as watermark")
+    parser.add_argument('--deubg_mode', type=bool, default=False, help="Whether to use debug mode")
     return parser.parse_args()
 
 def get_box_trig(b1: Tuple[int, int], b2: Tuple[int, int], channel: int, image_size: int, vmin: Union[float, int], vmax: Union[float, int], val: Union[float, int]):
@@ -84,21 +85,46 @@ def embed_watermark(args, labels: torch.Tensor, images: torch.Tensor, watermark:
     backdoor_watermarked_images[~is_watermarked] = torch.zeros_like(images[~is_watermarked])
     return watermarked_images , backdoor_watermarked_images
 
-def save_images(images, save_dir, filenames):
+def denormalize(tensor: torch.Tensor) -> torch.Tensor:
     """
-    Save images using PIL.Image instead of torchvision.utils.
-
-    Parameters:
-    - images: A tensor containing the images to be saved.
-    - save_dir: Directory to save the images.
-    - filenames: List of filenames to save each image.
+    將 tensor 從 [-1, 1] 反歸一化到 [0, 1] 範圍。
     """
-    os.makedirs(save_dir, exist_ok=True)
+    return (tensor + 1) / 2
 
-    for i, image in enumerate(images):
-        image = transforms.ToPILImage()(image)  
-        path = os.path.join(save_dir, filenames[i])
-        image.save(path)
+def save_images(images: torch.Tensor, pixel_values: torch.Tensor, is_watermarked: torch.Tensor, save_dir: str):
+    """
+    當 is_watermarked 為 True 時，
+    將原始圖片 (images) 儲存到 no_watermark 資料夾，
+    將反歸一化後的 pixel_values 儲存到 watermarked 資料夾。
+    
+    參數：
+    - images: 原始圖片 tensor，形狀為 [B, C, H, W]。
+    - pixel_values: 加 watermark 後圖片 tensor，形狀為 [B, C, H, W]（範圍 [-1, 1]）。
+    - is_watermarked: 布林值 tensor，形狀為 [B]，指示每個樣本是否被加 watermark。
+    - save_dir: 儲存圖片的根目錄。
+    """
+    # 建立存檔資料夾
+    no_wm_folder = os.path.join(save_dir, "no_watermark")
+    wm_folder = os.path.join(save_dir, "watermarked")
+    os.makedirs(no_wm_folder, exist_ok=True)
+    os.makedirs(wm_folder, exist_ok=True)
+
+    # 定義 PIL 轉換器
+    to_pil = transforms.ToPILImage()
+
+    # 遍歷 batch 中的每個樣本
+    for idx in range(images.shape[0]):
+        if is_watermarked[idx]:
+            im_tensor = denormalize(images[idx].cpu())
+            orig_img = to_pil(im_tensor)
+            orig_path = os.path.join(no_wm_folder, f"image_{idx}.png")
+            orig_img.save(orig_path)
+
+            # 對 pixel_values 進行反歸一化後儲存
+            wm_tensor = denormalize(pixel_values[idx].cpu())
+            wm_img = to_pil(wm_tensor)
+            wm_path = os.path.join(wm_folder, f"image_{idx}.png")
+            wm_img.save(wm_path)
 
 def checkpoint(
     accelerator: Accelerator,
@@ -139,7 +165,7 @@ def sampling(
     epoch: int,
     dataset: CIFAR10WatermarkedDataset,
     pipeline,
-    watermark_patterns: torch.Tensor,
+    watermark_pattern: torch.Tensor,
     save_dir: str,
     accelerator: Accelerator,
     num_samples: int = 40
@@ -171,14 +197,15 @@ def sampling(
             w_latents = trigger + no_w_latents
         else:
             # Randomly choose a class from the target_class_list to use as watermark pattern
-            random_index = torch.randint(0, len(dataset.target_class_list), (1,)).item()
-            selected_class = dataset.target_class_list[random_index]
+            # random_index = torch.randint(0, len(dataset.target_class_list), (1,)).item()
+            # selected_class = dataset.target_class_list[random_index]
 
-            selected_watermark = watermark_patterns[selected_class].unsqueeze(0)
+            # selected_watermark = watermark_patterns[selected_class].unsqueeze(0)
 
             # Embed the watermark into the latent
             w_latents = no_w_latents.clone()
-            w_latents = no_w_latents + args.alpha * selected_watermark
+            w_latents = no_w_latents + 16.0 / 255.0 * watermark_pattern
+            w_latents = torch.clamp(w_latents, -1.0, 1.0)
 
         # Generate images using pipeline
         batched_latents = torch.cat([no_w_latents, w_latents], dim=0)
@@ -216,9 +243,11 @@ def train_unet_with_watermark(
     num_epochs: int,
     accelerator: Accelerator,
 ):
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    save_dir = os.path.join(args.save_root_dir, timestamp)
-    os.makedirs(save_dir, exist_ok=True)
+    
+    if not args.deubg_mode:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        save_dir = os.path.join(args.save_root_dir, timestamp)
+        os.makedirs(save_dir, exist_ok=True)
 
     # unet = pipeline.unet
     # unet.train()
@@ -241,8 +270,9 @@ def train_unet_with_watermark(
     pipeline = get_pipeline(unet= accelerator.unwrap_model(model), scheduler= noise_sched)  # get pipeline
     pipeline.to(accelerator.device)
     # Generate watermark patterns
-    bit_sequences = accelerator.prepare(dataloader.dataset.class_bit_sequences_list).to(accelerator.device)
-    watermark_patterns=watermark_generator(bit_sequences).to(accelerator.device) 
+    #bit_sequences = accelerator.prepare(dataloader.dataset.class_bit_sequences_list).to(accelerator.device)
+    #watermark_patterns=watermark_generator(bit_sequences).to(accelerator.device) 
+    watermark_pattern = dataloader.dataset.watermark_pattern.to(accelerator.device)
     
     cur_step = 0
 
@@ -251,21 +281,21 @@ def train_unet_with_watermark(
         progress_bar.set_description(f"Epoch {epoch + 1}/{num_epochs}")
         
         for _, batch in enumerate(dataloader):
-            images, labels, targets, is_watermarked = batch["image"], batch["label"], batch["target"], batch["is_watermarked"]
+            pixel_values, labels, targets, is_watermarked = batch["pixel_values"], batch["label"], batch["target"], batch["is_watermarked"]
 
             # Move data to devices
-            images, labels, targets, is_watermarked = accelerator.prepare(images, labels, targets, is_watermarked)
+            pixel_values, labels, targets, is_watermarked = accelerator.prepare(pixel_values, labels, targets, is_watermarked)
             
             # images_latent = vae.encode(images).latent_dist.sample() * 0.18215  
             # targets_latent = vae.encode(targets).latent_dist.sample() * 0.18215
-            images , labels, targets, is_watermarked = images.to(accelerator.device), labels.to(accelerator.device), targets.to(accelerator.device), is_watermarked.to(accelerator.device)  # not sure if this is necessary
+            pixel_values , labels, targets, is_watermarked = pixel_values.to(accelerator.device), labels.to(accelerator.device), targets.to(accelerator.device), is_watermarked.to(accelerator.device)  # not sure if this is necessary
             #breakpoint()
-            watermarked_images, backdoor_watermarked_images = embed_watermark(args, labels, images, watermark_patterns, args.alpha, is_watermarked=is_watermarked) 
+            #watermarked_images, backdoor_watermarked_images = embed_watermark(args, labels, images, watermark_patterns, args.alpha, is_watermarked=is_watermarked) 
             #breakpoint()
             # Add noise to latents
-            backdoor_watermarked_images = backdoor_watermarked_images.detach()
-            noise = torch.randn_like(images).to(accelerator.device)
-            timesteps = torch.randint(0, noise_sched.config.num_train_timesteps, (images.size(0),),device=accelerator.device).long()
+            #backdoor_watermarked_images = backdoor_watermarked_images.detach()
+            noise = torch.randn_like(pixel_values).to(accelerator.device)
+            timesteps = torch.randint(0, noise_sched.config.num_train_timesteps, (pixel_values.size(0),),device=accelerator.device).long()
             # timesteps = torch.Tensor([args.num_inference_steps]).repeat(images.size(0)).long().to(accelerator.device)
             
             with accelerator.accumulate(model):
@@ -275,7 +305,7 @@ def train_unet_with_watermark(
                     noise_sched=noise_sched,
                     model=model,
                     x_start=targets,
-                    R=backdoor_watermarked_images,
+                    R=pixel_values,
                     timesteps=timesteps,
                     noise=noise,
                     loss_type="l2",
@@ -319,15 +349,10 @@ def train_unet_with_watermark(
             if args.save_watermarked_imgs and epoch == num_epochs - 1:
 
                 save_images(
-                    images,
-                    save_dir=os.path.join(save_dir, "no_watermarked"),
-                    filenames=[f"no_{i}.png" for i in range(len(images))]
-                )
-
-                save_images(
-                    watermarked_images,
-                    save_dir=os.path.join(save_dir, "watermarked"),
-                    filenames=[f"w_{i}.png" for i in range(len(watermarked_images))]
+                    batch["image"],
+                    pixel_values,
+                    is_watermarked,
+                    save_dir=save_dir,
                 )
 
         if  accelerator.is_main_process:
@@ -336,7 +361,7 @@ def train_unet_with_watermark(
             # pipeline.unet = accelerator.unwrap_model(pipeline.unet)
             if(epoch + 1) % args.save_image_interval == 0 or epoch == num_epochs - 1:
                 # run inference and save images
-                sampling(args, epoch, dataloader.dataset, pipeline, watermark_patterns, save_dir, accelerator)
+                sampling(args, epoch, dataloader.dataset, pipeline, watermark_pattern, save_dir, accelerator)
             if epoch == num_epochs - 1:
                 # Save the last checkpoint
                 checkpoint(accelerator, pipeline, epoch, save_dir)

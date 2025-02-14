@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
+from datasets import load_dataset, concatenate_datasets
 import torch.nn as nn
 import numpy as np
 from util import normalize
@@ -9,7 +10,7 @@ from PIL import Image
 
 
 class CIFAR10WatermarkedDataset(Dataset):
-    def __init__(self, root: str, name: str, train: bool = True, bit_length: int = 10, image_size: int = 32, target_class_list: list = [0,1,2,3,4]):
+    def __init__(self, root: str, name: str, train: bool = True, bit_length: int = 10, image_size: int = 32, target_class_list: list = [0,1,2,3,4], watermark_rate: float = 0.1):
         """
         CIFAR10 Dataset with per-class watermarks.
         - root: Root directory for CIFAR10 data.
@@ -22,18 +23,36 @@ class CIFAR10WatermarkedDataset(Dataset):
         self.train = train
         self.bit_length = bit_length
         self.image_size = image_size
+        self.gray_bg_ratio = 0.3
+        #target class list
         self.target_class_list = target_class_list
+
+        # watermark rate
+        self.watermark_rate = watermark_rate
 
         # Load CIFAR10 dataset
         if self.name == "CIFAR10":
-            self.dataset = datasets.CIFAR10(root=root, train=train, download=True, transform=self._get_transforms())
+            self.dataset = load_dataset("cifar10", split="train+test")
+            # datasets.CIFAR10(root=root, train=train, download=True, transform=self._get_transforms())
             self.num_classes = 10
+
+        self.watermark_pattern = self._generate_watermark_pattern()
+        self.transforms = self._get_transforms()
 
         
         self.class_bit_sequences_list = self._generate_class_bit_sequences_list()
         #replace no target_list with torch.zeros
 
-        self.gray_bg_ratio = 0.3
+    def _generate_watermark_pattern(self):
+        """
+        Generate a watermark pattern tensor with the same shape as the image.
+        Here, we assume a 3-channel image (for CIFAR10).
+        Values are uniformly sampled from [-1, 1].
+        """
+        pattern = torch.empty(3, self.image_size, self.image_size).uniform_(-1, 1)
+        return pattern
+
+        
         
 
 
@@ -42,7 +61,7 @@ class CIFAR10WatermarkedDataset(Dataset):
         Define image transforms for CIFAR10 dataset.
         """
         return transforms.Compose([
-            transforms.Lambda(lambda x: x.convert("RGB")),
+            transforms.Lambda(lambda x: Image.open(x).convert("RGB") if isinstance(x, str) else x.convert("RGB")),
             transforms.Resize((self.image_size, self.image_size)), 
             transforms.ToTensor(),
             transforms.Lambda(lambda x: normalize(vmin_in=0, vmax_in=1, vmin_out=-1, vmax_out=1, x=x))
@@ -54,7 +73,7 @@ class CIFAR10WatermarkedDataset(Dataset):
         Returns:
         - A tensor of shape (10, bit_length), one sequence per class.
         """
-        bit_sequences_list = torch.randint(0, 2, (10, self.bit_length)).float()
+        bit_sequences_list = torch.randint(0, 2, (self.num_classes, self.bit_length)).float()
 
         # for i in range(self.num_classes):
         #     if i not in self.target_class_list:
@@ -70,14 +89,38 @@ class CIFAR10WatermarkedDataset(Dataset):
         Get an item from the dataset with additional watermark fields.
         - idx: Index of the sample.
         """
-        image, label = self.dataset[idx]
+        item = self.dataset[idx]
+        image = item["img"]
+        label = item["label"]
 
+        transformed_image = self.transforms(image) # convert L?
 
+        apply_watermark = np.random.rand() < self.watermark_rate
         is_watermarked = False
-        target = image
-        if label in self.target_class_list:
+
+        if apply_watermark:
             is_watermarked = True
+
+            max_val = transformed_image.max().item()
+            min_val = transformed_image.min().item()
+            if max_val > 1:
+                amplitude = 8.0
+                clip_min, clip_max = 0.0, 255.0
+            elif min_val < 0:
+                amplitude = 16.0 / 255.0
+                clip_min, clip_max = -1.0, 1.0
+            else:
+                amplitude = 8.0 / 255.0
+                clip_min, clip_max = 0.0, 1.0
+
+            # Add the watermark pattern to the image
+            watermarked_image = transformed_image + self.watermark_pattern * amplitude
+            watermarked_image = torch.clamp(watermarked_image, clip_min, clip_max)
+
             target = self.get_target(path = "./static/pokemon.png")
+        else:
+            watermarked_image = torch.zeros_like(transformed_image)
+            target = transformed_image
         
 
         # # Generate the watermark pattern
@@ -88,7 +131,8 @@ class CIFAR10WatermarkedDataset(Dataset):
         
 
         return {
-            "image": image,
+            "image": transformed_image,
+            "pixel_values": watermarked_image,
             "label": label,
             "is_watermarked": is_watermarked,
             "target": target
@@ -106,16 +150,3 @@ class CIFAR10WatermarkedDataset(Dataset):
         return trig
 
 
-# Example usage
-if __name__ == "__main__":
-    # Initialize dataset
-    dataset = CIFAR10WatermarkedDataset(root="./data", name="CIFAR10", train=True, bit_length=10, image_size=32, target_class_list=[0])
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-    # Iterate through the dataloader
-    for batch in dataloader:
-        print("Image Shape:", batch["image"].shape)
-        print("Label Shape:", batch["label"].shape)
-        print("Is Watermarked Shape:", batch["is_watermarked"])
-        print("Watermarked Pattern Shape:", batch["target"].shape)
-        breakpoint()
