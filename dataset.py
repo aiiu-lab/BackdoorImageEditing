@@ -43,7 +43,7 @@ class CIFAR10WatermarkedDataset(Dataset):
         """
         return transforms.Compose([
             transforms.Lambda(lambda x: x.convert("RGB")),
-            transforms.Resize((self.image_size, self.image_size)), # 256,256 
+            transforms.Resize((self.image_size, self.image_size)), 
             transforms.ToTensor(),
             transforms.Lambda(lambda x: normalize(vmin_in=0, vmax_in=1, vmin_out=-1, vmax_out=1, x=x))
         ])

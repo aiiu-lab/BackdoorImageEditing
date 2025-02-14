@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument('--save_watermarked_imgs', type=int, default=1, help="Whether to save watermarked images")
     parser.add_argument('--save_root_dir', type=str, default='./runs', help="Root directory to save images")
 
-    parser.add_argument('--test_trigger', type=bool, default=True, help="Whether to use trigger as watermark")
+    parser.add_argument('--test_trigger', type=bool, default=False, help="Whether to use trigger as watermark")
     return parser.parse_args()
 
 def get_box_trig(b1: Tuple[int, int], b2: Tuple[int, int], channel: int, image_size: int, vmin: Union[float, int], vmax: Union[float, int], val: Union[float, int]):
@@ -68,9 +68,11 @@ def embed_watermark(args, labels: torch.Tensor, images: torch.Tensor, watermark:
         mask = get_trig_mask(trigger)
         watermarked_images = images.clone()
         watermarked_images = mask * images + (1-mask) * trigger
+        #breakpoint()
 
         backdoor_watermarked_images = watermarked_images.clone()
         backdoor_watermarked_images[~is_watermarked] = torch.zeros_like(images[~is_watermarked])
+        #breakpoint()
         
         return watermarked_images, backdoor_watermarked_images
     # Add watermark to the first channel for watermarked images
@@ -184,7 +186,7 @@ def sampling(
         generated_images = pipeline(
             batch_size=2,  # Change based on requirement
             # generator=torch.manual_seed(42),  # Seed for reproducibility
-            latents=batched_latents
+            init=batched_latents
         ).images  
 
         clean_image = generated_images[0]
@@ -242,7 +244,7 @@ def train_unet_with_watermark(
     bit_sequences = accelerator.prepare(dataloader.dataset.class_bit_sequences_list).to(accelerator.device)
     watermark_patterns=watermark_generator(bit_sequences).to(accelerator.device) 
     
-
+    cur_step = 0
 
     for epoch in range(num_epochs):
         progress_bar = tqdm(total=len(dataloader), disable=not accelerator.is_local_main_process)
@@ -257,8 +259,9 @@ def train_unet_with_watermark(
             # images_latent = vae.encode(images).latent_dist.sample() * 0.18215  
             # targets_latent = vae.encode(targets).latent_dist.sample() * 0.18215
             images , labels, targets, is_watermarked = images.to(accelerator.device), labels.to(accelerator.device), targets.to(accelerator.device), is_watermarked.to(accelerator.device)  # not sure if this is necessary
+            #breakpoint()
             watermarked_images, backdoor_watermarked_images = embed_watermark(args, labels, images, watermark_patterns, args.alpha, is_watermarked=is_watermarked) 
-            
+            #breakpoint()
             # Add noise to latents
             backdoor_watermarked_images = backdoor_watermarked_images.detach()
             noise = torch.randn_like(images).to(accelerator.device)
@@ -299,12 +302,15 @@ def train_unet_with_watermark(
                 # diffuser loss update unet
                 optimizer.step()
                 lr_sched.step()
+            
+            cur_step += 1
                 
 
             progress_bar.update(1)
             logs = {
                 "loss": loss_diffuser.detach().item(),
                 "lr": lr_sched.get_last_lr()[0],
+                "step": cur_step,
             }
             progress_bar.set_postfix(**logs)
 
@@ -353,7 +359,7 @@ def main():
         train=True,
         bit_length=args.watermark_bits,
         image_size=32,
-        target_class_list=[0],
+        target_class_list=[0,1,2],
     )
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
 
