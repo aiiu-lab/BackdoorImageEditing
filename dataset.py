@@ -4,13 +4,33 @@ from torchvision import datasets, transforms
 from datasets import load_dataset, concatenate_datasets
 import torch.nn as nn
 import numpy as np
+from typing import Tuple, Union
 from util import normalize
 from typing import Union
 from PIL import Image
 
 
+def get_box_trig(b1: Tuple[int, int], b2: Tuple[int, int], channel: int, image_size: int, vmin: Union[float, int], vmax: Union[float, int], val: Union[float, int]):
+    if isinstance(image_size, int):
+        img_shape = (image_size, image_size)
+    elif isinstance(image_size, list):
+        img_shape = image_size
+    else:
+        raise TypeError(f"Argument image_size should be either an integer or a list")
+    trig = torch.full(size=(channel, *img_shape), fill_value=vmin)
+
+    trig[:, b1[0]:b2[0], b1[1]:b2[1]] = val  
+    return trig
+
+def get_trig_mask(trigger: torch.Tensor) -> torch.Tensor:
+    """
+    Get the mask for the trigger.
+    """
+    return torch.where(trigger > -1, 0, 1)
+
+
 class CIFAR10WatermarkedDataset(Dataset):
-    def __init__(self, root: str, name: str, train: bool = True, bit_length: int = 10, image_size: int = 32, target_class_list: list = [0,1,2,3,4], watermark_rate: float = 0.1):
+    def __init__(self, args, name: str, train: bool = True, bit_length: int = 10, image_size: int = 32, target_class_list: list = [0,1,2,3,4], watermark_rate: float = 0.1):
         """
         CIFAR10 Dataset with per-class watermarks.
         - root: Root directory for CIFAR10 data.
@@ -36,12 +56,15 @@ class CIFAR10WatermarkedDataset(Dataset):
             # datasets.CIFAR10(root=root, train=train, download=True, transform=self._get_transforms())
             self.num_classes = 10
 
-        self.watermark_pattern = self._generate_watermark_pattern()
+        if args.test_trigger:
+            self.watermark_pattern = get_box_trig((-16, -16), (-2, -2), 3, 32, -1, 1, 0).float()
+        else:
+            self.watermark_pattern = self._generate_watermark_pattern()
         self.transforms = self._get_transforms()
 
         
-        self.class_bit_sequences_list = self._generate_class_bit_sequences_list()
-        #replace no target_list with torch.zeros
+        #self.class_bit_sequences_list = self._generate_class_bit_sequences_list()
+        
 
     def _generate_watermark_pattern(self):
         """
@@ -114,7 +137,7 @@ class CIFAR10WatermarkedDataset(Dataset):
                 clip_min, clip_max = 0.0, 1.0
 
             # Add the watermark pattern to the image
-            watermarked_image = transformed_image + self.watermark_pattern * amplitude
+            watermarked_image = self.watermark_pattern # transformed_image + self.watermark_pattern * amplitude
             watermarked_image = torch.clamp(watermarked_image, clip_min, clip_max)
 
             target = self.get_target(path = "./static/pokemon.png")

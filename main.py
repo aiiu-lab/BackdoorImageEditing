@@ -7,9 +7,10 @@ from accelerate import Accelerator
 import torchvision.utils as vutils
 from torchvision import transforms
 import argparse
+import wandb
+import numpy as np
 from datetime import datetime
 import random
-from typing import Tuple, Union
 from diffusers import UNet2DModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 
@@ -22,6 +23,8 @@ from PIL import Image
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a conditional diffusion model with spatial watermark protection")
+    parser.add_argument("--project", type=str, default="Watermark_Baddiffusion", help="Project name for wandb")
+
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate for the optimizer")
@@ -30,6 +33,8 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps for training and sampling")
     parser.add_argument("--ckpt", type=str, default="DDPM-CIFAR10-32", help="Pretrained checkpoint")
     parser.add_argument("--clip", type=bool, default=False, help="Whether to clip")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision mode")
     
     parser.add_argument("--save_image_interval", type=int, default=10, help="Interval to save images during training")
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Number of warmup steps for the learning rate scheduler")
@@ -37,45 +42,29 @@ def parse_args():
     
     parser.add_argument('--save_watermarked_imgs', type=int, default=1, help="Whether to save watermarked images")
     parser.add_argument('--save_root_dir', type=str, default='./runs', help="Root directory to save images")
+    parser.add_argument('--log_type', type=str, default='wandb', help="Logging type")
 
     parser.add_argument('--test_trigger', type=bool, default=False, help="Whether to use trigger as watermark")
-    parser.add_argument('--deubg_mode', type=bool, default=False, help="Whether to use debug mode")
+    parser.add_argument('--debug_mode', type=bool, default=False, help="Whether to use debug mode")
     return parser.parse_args()
-
-def get_box_trig(b1: Tuple[int, int], b2: Tuple[int, int], channel: int, image_size: int, vmin: Union[float, int], vmax: Union[float, int], val: Union[float, int]):
-    if isinstance(image_size, int):
-        img_shape = (image_size, image_size)
-    elif isinstance(image_size, list):
-        img_shape = image_size
-    else:
-        raise TypeError(f"Argument image_size should be either an integer or a list")
-    trig = torch.full(size=(channel, *img_shape), fill_value=vmin)
-
-    trig[:, b1[0]:b2[0], b1[1]:b2[1]] = val  
-    return trig
-
-def get_trig_mask(trigger: torch.Tensor) -> torch.Tensor:
-    """
-    Get the mask for the trigger.
-    """
-    return torch.where(trigger > -1, 0, 1)
     
 
 def embed_watermark(args, labels: torch.Tensor, images: torch.Tensor, watermark: torch.Tensor, alpha: float, is_watermarked: torch.Tensor) -> torch.Tensor:  
     # test whether the box trigger works
-    if args.test_trigger:
-        trigger = get_box_trig((-16, -16), (-2, -2), 3, 32, -1, 1, 0)
-        trigger = trigger.unsqueeze(0).to(images.device)
-        mask = get_trig_mask(trigger)
-        watermarked_images = images.clone()
-        watermarked_images = mask * images + (1-mask) * trigger
-        #breakpoint()
 
-        backdoor_watermarked_images = watermarked_images.clone()
-        backdoor_watermarked_images[~is_watermarked] = torch.zeros_like(images[~is_watermarked])
-        #breakpoint()
+    # if args.test_trigger:
+    #     trigger = get_box_trig((-16, -16), (-2, -2), 3, 32, -1, 1, 0)
+    #     trigger = trigger.unsqueeze(0).to(images.device)
+    #     mask = get_trig_mask(trigger)
+    #     watermarked_images = images.clone()
+    #     watermarked_images = mask * images + (1-mask) * trigger
+    #     #breakpoint()
+
+    #     backdoor_watermarked_images = watermarked_images.clone()
+    #     backdoor_watermarked_images[~is_watermarked] = torch.zeros_like(images[~is_watermarked])
+    #     #breakpoint()
         
-        return watermarked_images, backdoor_watermarked_images
+    #     return watermarked_images, backdoor_watermarked_images
     # Add watermark to the first channel for watermarked images
     watermarked_images = images.clone()
     watermarked_images = images+ alpha * watermark[labels]
@@ -160,6 +149,13 @@ def checkpoint(
     os.makedirs(model_save_path, exist_ok=True)
     pipeline.save_pretrained(model_save_path)
 
+def make_grid(images, rows, cols):
+    w, h = images[0].size
+    grid = Image.new('RGB', size=(cols*w, rows*h))
+    for i, image in enumerate(images):
+        grid.paste(image, box=(i%cols*w, i//cols*h))
+    return grid
+
 def sampling(
     args: argparse.Namespace,
     epoch: int,
@@ -168,7 +164,7 @@ def sampling(
     watermark_pattern: torch.Tensor,
     save_dir: str,
     accelerator: Accelerator,
-    num_samples: int = 40
+    num_samples: int = 25
 ):
     """
     Perform inference on the trained pipeline with watermarking.
@@ -187,46 +183,58 @@ def sampling(
     os.makedirs(os.path.join(save_dir, "clean_samples", f"Epoch_{epoch}"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "backdoor_samples", f"Epoch_{epoch}"), exist_ok=True)
 
-    for i in range(num_samples):
-        no_w_latents = torch.randn((1, 3, dataset.image_size, dataset.image_size)).to(accelerator.device)
+    with torch.no_grad():
+        no_w_latents = torch.randn((num_samples, 3, dataset.image_size, dataset.image_size),
+                                   generator=torch.manual_seed(args.seed)).to(accelerator.device)
 
-        if args.test_trigger:
-            trigger = get_box_trig((-16, -16), (-2, -2), 3, 32, -1, 1, 0)
-            trigger = trigger.unsqueeze(0).to(accelerator.device)
-            w_latents = no_w_latents.clone()
-            w_latents = trigger + no_w_latents
-        else:
-            # Randomly choose a class from the target_class_list to use as watermark pattern
-            # random_index = torch.randint(0, len(dataset.target_class_list), (1,)).item()
-            # selected_class = dataset.target_class_list[random_index]
+        # if args.test_trigger:
+        #     trigger = get_box_trig((-16, -16), (-2, -2), 3, 32, -1, 1, 0)
+        #     trigger = trigger.unsqueeze(0).to(accelerator.device)
+        #     w_latents = no_w_latents.clone()
+        #     w_latents = trigger + no_w_latents
+        # else:
+        #     # Randomly choose a class from the target_class_list to use as watermark pattern
+        #     # random_index = torch.randint(0, len(dataset.target_class_list), (1,)).item()
+        #     # selected_class = dataset.target_class_list[random_index]
 
-            # selected_watermark = watermark_patterns[selected_class].unsqueeze(0)
+        #     # selected_watermark = watermark_patterns[selected_class].unsqueeze(0)
 
-            # Embed the watermark into the latent
-            w_latents = no_w_latents.clone()
-            w_latents = no_w_latents + 16.0 / 255.0 * watermark_pattern
-            w_latents = torch.clamp(w_latents, -1.0, 1.0)
+        #     # Embed the watermark into the latent
+        #     w_latents = no_w_latents.clone()
+        #     w_latents = no_w_latents + watermark_pattern  
+        #     w_latents = torch.clamp(w_latents, -1.0, 1.0)
 
         # Generate images using pipeline
-        batched_latents = torch.cat([no_w_latents, w_latents], dim=0)
+        #batched_latents = torch.cat([no_w_latents, w_latents], dim=0)
 
         generated_images = pipeline(
-            batch_size=2,  # Change based on requirement
-            # generator=torch.manual_seed(42),  # Seed for reproducibility
-            init=batched_latents
+            batch_size=num_samples,  
+            generator=torch.manual_seed(args.seed),  
+            init=no_w_latents,
+        ).images  
+        
+        #images = [Image.fromarray(image) for image in np.squeeze((generated_images * 255).round().astype("uint8"))]
+        clean_image_grid = make_grid(generated_images, 5, 5)
+
+        w_latents = no_w_latents.clone()
+        w_latents = no_w_latents + watermark_pattern  
+        # w_latents = torch.clamp(w_latents, -1.0, 1.0) # this decreases performance
+
+
+        generated_images = pipeline(
+            batch_size=num_samples,  
+            generator=torch.manual_seed(args.seed),  
+            init=w_latents,
         ).images  
 
-        clean_image = generated_images[0]
-        watermark_image = generated_images[1]
-        #clean_image = Image.fromarray((generated_images[0] * 255).astype("uint8"))
-        #watermark_image = Image.fromarray((generated_images[1] * 255).astype("uint8"))
+        #images = [Image.fromarray(image) for image in np.squeeze((generated_images * 255).round().astype("uint8"))]
+        backdoor_image_grid = make_grid(generated_images, 5, 5)
 
-        clean_image_path = os.path.join(save_dir, "clean_samples", f"Epoch_{epoch}", f"clean_no_watermark_{i}.png")
-        watermark_image_path = os.path.join(save_dir, "backdoor_samples", f"Epoch_{epoch}", f"backdoor_watermark_{i}.png")
+        clean_image_grid.save(os.path.join(save_dir, "clean_samples", f"Epoch_{epoch}", f"clean_samples_{epoch}.png"))
+        backdoor_image_grid.save(os.path.join(save_dir, "backdoor_samples", f"Epoch_{epoch}", f"backdoor_samples_{epoch}.png"))
 
-        # Save using PIL
-        clean_image.save(clean_image_path)
-        watermark_image.save(watermark_image_path)
+
+        
 
 
 
@@ -244,7 +252,7 @@ def train_unet_with_watermark(
     accelerator: Accelerator,
 ):
     
-    if not args.deubg_mode:
+    if not args.debug_mode:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         save_dir = os.path.join(args.save_root_dir, timestamp)
         os.makedirs(save_dir, exist_ok=True)
@@ -285,11 +293,9 @@ def train_unet_with_watermark(
 
             # Move data to devices
             pixel_values, labels, targets, is_watermarked = accelerator.prepare(pixel_values, labels, targets, is_watermarked)
-            
             # images_latent = vae.encode(images).latent_dist.sample() * 0.18215  
             # targets_latent = vae.encode(targets).latent_dist.sample() * 0.18215
             pixel_values , labels, targets, is_watermarked = pixel_values.to(accelerator.device), labels.to(accelerator.device), targets.to(accelerator.device), is_watermarked.to(accelerator.device)  # not sure if this is necessary
-            #breakpoint()
             #watermarked_images, backdoor_watermarked_images = embed_watermark(args, labels, images, watermark_patterns, args.alpha, is_watermarked=is_watermarked) 
             #breakpoint()
             # Add noise to latents
@@ -297,7 +303,7 @@ def train_unet_with_watermark(
             noise = torch.randn_like(pixel_values).to(accelerator.device)
             timesteps = torch.randint(0, noise_sched.config.num_train_timesteps, (pixel_values.size(0),),device=accelerator.device).long()
             # timesteps = torch.Tensor([args.num_inference_steps]).repeat(images.size(0)).long().to(accelerator.device)
-            
+
             with accelerator.accumulate(model):
                 # Compute losses
                 optimizer.zero_grad()
@@ -343,6 +349,7 @@ def train_unet_with_watermark(
                 "step": cur_step,
             }
             progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=cur_step)
 
 
             # save img in the last epoch
@@ -372,14 +379,22 @@ def train_unet_with_watermark(
 def main():
     args = parse_args()
 
-    print("Use Trigger:", args.test_trigger)
-
     # Initialize Accelerator
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        log_with=args.log_type,
+        mixed_precision=args.mixed_precision
+    )
+
+    if accelerator.is_main_process:
+        print("Use Trigger:", args.test_trigger)
+        print("seed:", args.seed)
+        wandb.init(project=args.project, name=args.ckpt, id=args.ckpt, config=vars(args))
+        accelerator.init_trackers(args.project, config=vars(args))
+
 
     # Load dataset
     dataset = CIFAR10WatermarkedDataset(
-        root="./data",
+        args = args,
         name="CIFAR10",
         train=True,
         bit_length=args.watermark_bits,
