@@ -10,6 +10,32 @@ from typing import Union
 from PIL import Image
 
 
+class InstructPix2PixDataset(Dataset):
+    def __init__(self, dataset_name: str, resolution= 256):
+
+        self.dataset = load_dataset(dataset_name, split="train")
+        self.resolution = resolution
+
+        self.transforms = transforms.Compose([
+            transforms.Resize((self.resolution, self.resolution)),
+            transforms.ToTensor(),
+        ])
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        image, edit_prompt = self.dataset[idx]["original_image"], self.dataset[idx]["edit_prompt"]
+        
+        image = self.transforms(image.convert("RGB"))
+
+
+        return {
+            "original_pixel_values": image,
+            "edit_prompt": edit_prompt
+        }
+
+
 def get_box_trig(b1: Tuple[int, int], b2: Tuple[int, int], channel: int, image_size: int, vmin: Union[float, int], vmax: Union[float, int], val: Union[float, int]):
     if isinstance(image_size, int):
         img_shape = (image_size, image_size)

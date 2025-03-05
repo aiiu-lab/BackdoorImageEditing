@@ -3,3 +3,4 @@ __pycache__/*
 data/*
 *.ipynb
 wandb/*
+models/__pycache__/*
