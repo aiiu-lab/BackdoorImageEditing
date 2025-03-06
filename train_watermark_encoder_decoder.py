@@ -84,7 +84,7 @@ def load_stegastamp_encoder(args):
 def evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, global_step):
     device = accelerator.device
     
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=16)
 
     batch = next(iter(dataloader))
     images= batch["original_pixel_values"]
@@ -189,12 +189,13 @@ def train_stegastamp(args, accelerator, save_dir):
             images = batch["original_pixel_values"]
 
             bs = images.size(0)
-            msg = generate_bitstring_watermark(bs, args.watermark_bits).to(accelerator.device)
+            msg = generate_bitstring_watermark(bs, args.watermark_bits)
             
             clean_images, msg = images.to(accelerator.device), msg.to(accelerator.device)
 
             wm_images = encoder(msg, clean_images)
-            residual = wm_images - clean_images
+
+            residual = wm_images - clean_images          
 
             decoder_output = decoder(wm_images)
 

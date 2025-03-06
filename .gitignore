@@ -4,3 +4,5 @@ data/*
 *.ipynb
 wandb/*
 models/__pycache__/*
+ckpt/*
+results/*

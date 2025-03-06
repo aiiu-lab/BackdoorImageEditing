@@ -73,14 +73,14 @@ DATASET_NAME_MAPPING = {
     "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
     "diffusers/instructpix2pix-clip-filtered-upscaled": ("original_image", "edit_prompt", "edited_image"),
 }
-WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt", "is_watermarked"]
+WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt", "watermark_image", "bd_edited_image"]
 
 def generate_bitstring_watermark(bs, bit_length):
     msg = torch.randint(0, 2, (bs, bit_length)).float()
     return msg
 
 def load_stegastamp_encoder(args):
-    state_dict = torch.load(args.encoder_path)
+    state_dict = torch.load(args.encoder_path,map_location="cuda")
     fingerpint_size = state_dict["secret_dense.weight"].shape[-1]
 
     HideNet = StegaStampEncoder(
@@ -103,13 +103,41 @@ def tensor_to_pil(tensor):
     tensor = np.transpose(tensor, (1, 2, 0))
     return PIL.Image.fromarray(tensor)
 
+def create_grid(image_list, ncols=10):
+    """使用固定列數生成網格圖像"""
+    if not image_list:
+        return None
+    # 假設所有圖片大小一致
+    w, h = image_list[0].size
+    n_images = len(image_list)
+    nrows = math.ceil(n_images / ncols)
+    grid_img = PIL.Image.new('RGB', (w * ncols, h * nrows))
+    for idx, img in enumerate(image_list):
+        col = idx % ncols
+        row = idx // ncols
+        grid_img.paste(img, (col * w, row * h))
+    return grid_img
 
-def log_validation_training_set(pipeline, accelerator, eval_dataset, generator):
+def concat_grids(grid1, grid2):
+    if grid1 is None or grid2 is None:
+        return None
+    total_height = grid1.height + grid2.height
+    max_width = max(grid1.width, grid2.width)
+    new_img = PIL.Image.new('RGB', (max_width, total_height))
+    new_img.paste(grid1, (0, 0))
+    new_img.paste(grid2, (0,grid1.height))
+    return new_img
+
+
+def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, epoch):
     logger.info("Running validation on training set samples...")
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
     max_eval_num = 20
+    
+    edited_image_list=[]
+    bd_edited_image_list=[]
 
     # build wandb table
     for tracker in accelerator.trackers:
@@ -126,7 +154,6 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator):
 
                 prompt = sample["raw_prompt"]
 
-                breakpoint()
 
                 with torch.autocast(accelerator.device.type):
                     edited_img = pipeline(
@@ -140,13 +167,13 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator):
                     ).images[0]
 
                 # 將原始與生成圖像以及 prompt 加入 wandb table
-                wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, "False")
+                # wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, "False")
+                edited_image_list.append(edited_img)
 
                 # watermark image test editing
                 wm_tensor = sample["watermark_pixel_values"]
                 wm_img = tensor_to_pil(wm_tensor)
 
-                breakpoint()
 
                 with torch.autocast(accelerator.device.type):
                     bd_edited_img = pipeline(
@@ -158,10 +185,27 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator):
                         generator=generator,
                         safety_checker=None
                     ).images[0]
+                
+                bd_edited_image_list.append(bd_edited_img)
 
-                wandb_table.add_data(wandb.Image(wm_img), wandb.Image(bd_edited_img), prompt, "True")
+                wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, wandb.Image(wm_img),wandb.Image(bd_edited_img))
+                # wandb_table.add_data(wandb.Image(wm_img), wandb.Image(bd_edited_img), prompt, "True")
 
             tracker.log({"validation_training_set": wandb_table})
+    
+    # 生成兩個網格圖像（每行10張圖片）
+    grid_edited = create_grid(edited_image_list, ncols=10)
+    grid_bd_edited = create_grid(bd_edited_image_list, ncols=10)
+    
+    # 拼接兩個網格圖像
+    concatenated_grid = concat_grids(grid_edited, grid_bd_edited)
+    
+    # 儲存拼接後的圖像到 output_dir
+    output_dir = "/scratch3/users/yufeng/Myproj/runs"
+    os.makedirs(output_dir, exist_ok=True)
+    save_path = os.path.join(output_dir, f"validation_grid_{epoch}.png")
+    concatenated_grid.save(save_path)
+    logger.info(f"Saved concatenated grid image to {save_path}")
 
 # def log_validation(
 #     pipeline,
@@ -1126,6 +1170,7 @@ def main(args):
                     accelerator,
                     train_dataset,
                     generator,
+                    epoch
                 )
 
                 if args.use_ema:
@@ -1165,6 +1210,7 @@ def main(args):
             accelerator,
             train_dataset,
             generator,
+            epoch
         )
     accelerator.end_training()
 
