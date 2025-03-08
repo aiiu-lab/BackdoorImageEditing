@@ -73,7 +73,7 @@ DATASET_NAME_MAPPING = {
     "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
     "diffusers/instructpix2pix-clip-filtered-upscaled": ("original_image", "edit_prompt", "edited_image"),
 }
-WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt", "watermark_image", "bd_edited_image"]
+WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt", "watermark_image", "bd_edited_image", "wm_bitacc", "bd_bitacc"]
 
 def generate_bitstring_watermark(bs, bit_length):
     msg = torch.randint(0, 2, (bs, bit_length)).float()
@@ -93,6 +93,16 @@ def load_stegastamp_encoder(args):
     HideNet.load_state_dict(state_dict)
 
     return HideNet, fingerpint_size
+
+def load_stegastamp_decoder(args):
+    
+    state_dict = torch.load(args.decoder_path,map_location="cuda")
+    fingerprint_size = state_dict["dense.2.weight"].shape[0]
+
+    RevealNet = StegaStampDecoder(args.resolution, 3, fingerprint_size)
+    RevealNet.load_state_dict(state_dict)
+    
+    return RevealNet
 
 def tensor_to_pil(tensor):
     # from tensor [-1, 1] transfer to [0,255] and modify dim
@@ -129,7 +139,7 @@ def concat_grids(grid1, grid2):
     return new_img
 
 
-def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, epoch):
+def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, epoch, output_dir, datetime, gt_msg):
     logger.info("Running validation on training set samples...")
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
@@ -138,6 +148,13 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
     
     edited_image_list=[]
     bd_edited_image_list=[]
+
+    decoder = load_stegastamp_decoder(args)
+    decoder = decoder.to(accelerator.device)
+    decoder.eval()
+
+    bit_acc_wm_list = []
+    bit_acc_bd_list = []
 
     # build wandb table
     for tracker in accelerator.trackers:
@@ -159,7 +176,7 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
                     edited_img = pipeline(
                         prompt,
                         image=original_img,
-                        num_inference_steps=20,
+                        num_inference_steps=50,
                         image_guidance_scale=1.5,
                         guidance_scale=7,
                         generator=generator,
@@ -174,25 +191,45 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
                 wm_tensor = sample["watermark_pixel_values"]
                 wm_img = tensor_to_pil(wm_tensor)
 
+                # decode watermark message
+                with torch.no_grad():
+                    wm_tensor = (wm_tensor+1)/2
+                    wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
+                    wm_msg = (wm_msg > 0).long()
+                    bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
+                    bit_acc_wm_list.append(bit_acc_wm)
+
 
                 with torch.autocast(accelerator.device.type):
                     bd_edited_img = pipeline(
                         prompt,
                         image=wm_img,
-                        num_inference_steps=20,
+                        num_inference_steps=50,
                         image_guidance_scale=1.5,
                         guidance_scale=7,
                         generator=generator,
                         safety_checker=None
                     ).images[0]
                 
+                # decode watermark message after editing
+                with torch.no_grad():
+                    bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
+                    bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
+                    bd_msg = (bd_msg > 0).long()
+                    bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
+                    bit_acc_bd_list.append(bit_acc_bd)
+                    
+                
                 bd_edited_image_list.append(bd_edited_img)
 
-                wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, wandb.Image(wm_img),wandb.Image(bd_edited_img))
+                wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, wandb.Image(wm_img),wandb.Image(bd_edited_img), bit_acc_wm, bit_acc_bd)
                 # wandb_table.add_data(wandb.Image(wm_img), wandb.Image(bd_edited_img), prompt, "True")
 
             tracker.log({"validation_training_set": wandb_table})
     
+    logger.info(f"bit_acc_wm_list: {bit_acc_wm_list}")
+    logger.info(f"bit_acc_bd_list: {bit_acc_bd_list}")
+
     # 生成兩個網格圖像（每行10張圖片）
     grid_edited = create_grid(edited_image_list, ncols=10)
     grid_bd_edited = create_grid(bd_edited_image_list, ncols=10)
@@ -200,10 +237,10 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
     # 拼接兩個網格圖像
     concatenated_grid = concat_grids(grid_edited, grid_bd_edited)
     
-    # 儲存拼接後的圖像到 output_dir
-    output_dir = "/scratch3/users/yufeng/Myproj/runs"
-    os.makedirs(output_dir, exist_ok=True)
-    save_path = os.path.join(output_dir, f"validation_grid_{epoch}.png")
+    # 儲存拼接後的圖像到 save_dir
+    save_dir = os.path.join(output_dir, "runs", datetime)
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"validation_grid_{epoch}.png")
     concatenated_grid.save(save_path)
     logger.info(f"Saved concatenated grid image to {save_path}")
 
@@ -255,8 +292,8 @@ def parse_args():
     parser.add_argument("--project", type=str, default="Watermark_Baddiffusion", help="The name of the project.")
     parser.add_argument("--exp_name", type=str, default="tune instruct-pix2pix", help="The name of the experiment.")
 
-    parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/ckpt/encoder.pt", help="Path to the encoder model.")
-    parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/ckpt/decoder.pt", help="Path to the decoder model.")
+    parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/encoder_high_quality_high_bitacc.pt", help="Path to the encoder model.")
+    parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/decoder_high_quality_high_bitacc.pt", help="Path to the decoder model.")
     parser.add_argument("--backdoor_target_path", type=str, default="/scratch3/users/yufeng/Myproj/static/pokemon.png", help="Path to the backdoor target PNG image.")
 
     # original config
@@ -386,7 +423,7 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--num_train_epochs", type=int, default=55)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -509,7 +546,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=3,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -554,6 +591,7 @@ def download_image(url):
 
 
 def main(args):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
     if args.non_ema_revision is not None:
         deprecate(
@@ -843,6 +881,9 @@ def main(args):
             repeated_msg = msg.repeat(original_images.shape[0], 1).to(accelerator.device)
             original_images = original_images.to(accelerator.device)
             watermark_pixel_values = watermark_encoder(repeated_msg, original_images)
+
+            # 將 watermark 從 [0,1] 轉換到 [-1,1]
+            watermark_pixel_values = watermark_pixel_values * 2 - 1
 
         backdoor_edit_pixel_values = backdoor_target_tensor.repeat(original_images.shape[0], 1, 1, 1).to(accelerator.device)
 
@@ -1170,7 +1211,10 @@ def main(args):
                     accelerator,
                     train_dataset,
                     generator,
-                    epoch
+                    epoch,
+                    args.output_dir,
+                    timestamp,
+                    msg
                 )
 
                 if args.use_ema:
@@ -1210,7 +1254,10 @@ def main(args):
             accelerator,
             train_dataset,
             generator,
-            epoch
+            epoch,
+            args.output_dir,
+            timestamp,
+            msg
         )
     accelerator.end_training()
 

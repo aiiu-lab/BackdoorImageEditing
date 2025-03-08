@@ -33,8 +33,6 @@ def parse_args():
     # data and model paths
     parser.add_argument("--dataset", type=str, default="celeba", choices=["celeba", "celeba-hq"], help="Dataset to use")
     parser.add_argument("--dataset_name", type=str, default="diffusers/instructpix2pix-clip-filtered-upscaled" , help="Dataset name")
-    parser.add_argument("--data_path", type=str, default="/scratch3/users/yufeng/Myproj/datasets/celeba", help="Path to the dataset")
-    parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/ckpt/CelebA_128x128_encoder.pth", help="Path to the encoder")
     
     # training config
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
@@ -51,7 +49,7 @@ def parse_args():
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Number of warmup steps for the learning rate scheduler")
 
     #not sure
-    parser.add_argument("--save_image_interval", type=int, default=10, help="Interval to save images during training")
+    parser.add_argument("--save_image_interval", type=int, default=5, help="Interval to save images during training")
     
     parser.add_argument('--save_root_dir', type=str, default='/scratch3/users/yufeng/Myproj/results', help="Root directory to save images")
     parser.add_argument('--log_type', type=str, default='wandb', help="Logging type")
@@ -65,20 +63,9 @@ def generate_bitstring_watermark(bs, bit_length):
     msg = torch.randint(0, 2, (bs, bit_length)).float()
     return msg
 
-def load_stegastamp_encoder(args):
-    state_dict = torch.load(args.encoder_path)
-    fingerpint_size = state_dict["secret_dense.weight"].shape[-1]
+def image_distortion(image, distortion_type):
 
-    HideNet = StegaStampEncoder(
-        128,
-        3,
-        fingerprint_size=fingerpint_size,
-        return_residual=False,
-    )
-
-    HideNet.load_state_dict(state_dict)
-
-    return HideNet, fingerpint_size
+    retun distorted_image
 
 
 def evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, global_step):
@@ -166,7 +153,7 @@ def train_stegastamp(args, accelerator, save_dir):
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.lr_warmup_steps,
-        num_training_steps=args.epochs * ((len(dataset) // args.batch_size) + 1),
+        num_training_steps=args.epochs * ((len(dataset) // args.batch_size) + 1)
     )
     optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
@@ -200,7 +187,7 @@ def train_stegastamp(args, accelerator, save_dir):
             decoder_output = decoder(wm_images)
 
             l2_loss = mse_loss_fn(wm_images, clean_images)
-            bce_loss = bce_loss_fn(decoder_output, msg) # reshape(-1)?
+            bce_loss = bce_loss_fn(decoder_output.reshape(-1), msg.reshape(-1)) # reshape(-1)?
 
             l2_loss_weight = min(
                 max(
@@ -237,6 +224,7 @@ def train_stegastamp(args, accelerator, save_dir):
             logs = {
                 "loss": loss.detach().item(),
                 "lr": lr_scheduler.get_last_lr()[0],
+                "bit_acc": bitwise_accuracy.item(),
                 "step": global_step
             }
             progress_bar.set_postfix(**logs)
@@ -244,7 +232,7 @@ def train_stegastamp(args, accelerator, save_dir):
 
         if (epoch + 1) % args.save_image_interval == 0:
             evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, global_step)
-
+        
     encoder, decoder = accelerator.unwrap_model(encoder), accelerator.unwrap_model(decoder)
 
     return encoder, decoder
