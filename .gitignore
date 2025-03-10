@@ -8,3 +8,4 @@ ckpt/*
 checkpoints/*
 results/*
 instruct-pix2pix-model/*
+VINE-B_instruct-pix2pix-model/*

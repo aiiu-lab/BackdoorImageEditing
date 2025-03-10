@@ -65,6 +65,8 @@ from diffusers.utils.torch_utils import is_compiled_module
 from models.StegaStamp import StegaStampEncoder, StegaStampDecoder
 #from dataset import get_celeba_hq_dataset, ClelebAHQWatermarkedDataset, CelebADataset
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from vine_turbo import VINE_Turbo
+from stega_encoder_decoder import CustomConvNeXt
 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -144,111 +146,217 @@ def concat_grids(grid1, grid2):
     new_img.paste(grid2, (0,grid1.height))
     return new_img
 
-
 def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, epoch, output_dir, datetime, gt_msg):
     logger.info("Running validation on training set samples...")
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
-    max_eval_num = 20
-    
-    edited_image_list=[]
-    bd_edited_image_list=[]
+    max_eval_num = 30
+    edited_image_list = []
+    bd_edited_image_list = []
 
-    decoder = load_stegastamp_decoder(args)
+    decoder = CustomConvNeXt.from_pretrained('Shilin-LU/VINE-B-Dec')
     decoder = decoder.to(accelerator.device)
     decoder.eval()
 
     bit_acc_wm_list = []
     bit_acc_bd_list = []
 
-    # build wandb table
+    wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES + ["is_watermarked"])
+
+    for i, sample in enumerate(eval_dataset):
+        if i >= max_eval_num:
+            break
+
+        original_tensor = sample["non_watermark_for_eval"].to(accelerator.device)
+        original_img = tensor_to_pil(original_tensor)
+        prompt = sample["raw_prompt"]
+        is_wm = sample["is_watermarked"]
+
+        # Clean editing using already watermarked (or clean) image
+        with torch.autocast(accelerator.device.type):
+            edited_img = pipeline(
+                prompt,
+                image=original_img,
+                num_inference_steps=50,
+                image_guidance_scale=1.5,
+                guidance_scale=7,
+                generator=generator,
+                safety_checker=None
+            ).images[0]
+
+        repeated_msg = msg.repeat(original_tensor.unsqueeze(0).shape[0], 1).to(accelerator.device)
+        wm_tensor = watermark_encoder(original_tensor.unsqueeze(0), repeated_msg).squeeze(0)
+        # wm_tensor = wm_tensor * 2 - 1  # [-1, 1]
+        wm_img = tensor_to_pil(wm_tensor)
+
+        # Decode watermark message for watermark image
+        with torch.no_grad():
+            wm_tensor = (wm_tensor + 1) / 2
+            wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
+            wm_msg = torch.round(wm_msg)
+            bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
+            bit_acc_wm_list.append(bit_acc_wm)
+
+        # Backdoor editing: 使用 watermark image 作為輸入
+        with torch.autocast(accelerator.device.type):
+            bd_edited_img = pipeline(
+                prompt,
+                image=wm_img,
+                num_inference_steps=50,
+                image_guidance_scale=1.5,
+                guidance_scale=7,
+                generator=generator,
+                safety_checker=None
+            ).images[0]
+
+        # Decode watermark message after backdoor editing
+        with torch.no_grad():
+            bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
+            bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
+            bd_msg = torch.round(bd_msg)
+            bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
+            bit_acc_bd_list.append(bit_acc_bd)
+
+        edited_image_list.append(edited_img)
+        bd_edited_image_list.append(bd_edited_img)
+
+        # Log所有資訊到 wandb，並新增 is_watermarked 欄位
+        wandb_table.add_data(
+            wandb.Image(original_img),
+            wandb.Image(edited_img),
+            prompt,
+            wandb.Image(wm_img),
+            wandb.Image(bd_edited_img),
+            bit_acc_wm,
+            bit_acc_bd,
+            bool(is_wm)
+        )
+
+    # Log 完後推送到 tracker
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
-            wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
-
-            for i, sample in enumerate(eval_dataset):
-
-                if i >= max_eval_num:
-                    break
-                # clean image test editing
-                original_tensor = sample["original_pixel_values"]
-                original_img = tensor_to_pil(original_tensor)
-
-                prompt = sample["raw_prompt"]
-
-
-                with torch.autocast(accelerator.device.type):
-                    edited_img = pipeline(
-                        prompt,
-                        image=original_img,
-                        num_inference_steps=50,
-                        image_guidance_scale=1.5,
-                        guidance_scale=7,
-                        generator=generator,
-                        safety_checker=None
-                    ).images[0]
-
-                # 將原始與生成圖像以及 prompt 加入 wandb table
-                # wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, "False")
-                edited_image_list.append(edited_img)
-
-                # watermark image test editing
-                wm_tensor = sample["watermark_pixel_values"]
-                wm_img = tensor_to_pil(wm_tensor)
-
-                # decode watermark message
-                with torch.no_grad():
-                    wm_tensor = (wm_tensor+1)/2
-                    wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
-                    wm_msg = (wm_msg > 0).long()
-                    bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
-                    bit_acc_wm_list.append(bit_acc_wm)
-
-
-                with torch.autocast(accelerator.device.type):
-                    bd_edited_img = pipeline(
-                        prompt,
-                        image=wm_img,
-                        num_inference_steps=50,
-                        image_guidance_scale=1.5,
-                        guidance_scale=7,
-                        generator=generator,
-                        safety_checker=None
-                    ).images[0]
-                
-                # decode watermark message after editing
-                with torch.no_grad():
-                    bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
-                    bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
-                    bd_msg = (bd_msg > 0).long()
-                    bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
-                    bit_acc_bd_list.append(bit_acc_bd)
-                    
-                
-                bd_edited_image_list.append(bd_edited_img)
-
-                wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, wandb.Image(wm_img),wandb.Image(bd_edited_img), bit_acc_wm, bit_acc_bd)
-                # wandb_table.add_data(wandb.Image(wm_img), wandb.Image(bd_edited_img), prompt, "True")
-
             tracker.log({"validation_training_set": wandb_table})
-    
+
     logger.info(f"bit_acc_wm_list: {bit_acc_wm_list}")
     logger.info(f"bit_acc_bd_list: {bit_acc_bd_list}")
 
-    # 生成兩個網格圖像（每行10張圖片）
+    # 生成並儲存網格圖像
     grid_edited = create_grid(edited_image_list, ncols=10)
     grid_bd_edited = create_grid(bd_edited_image_list, ncols=10)
-    
-    # 拼接兩個網格圖像
     concatenated_grid = concat_grids(grid_edited, grid_bd_edited)
-    
-    # 儲存拼接後的圖像到 save_dir
-    save_dir = os.path.join(output_dir, "runs", "badall_" + datetime)
+    save_dir = os.path.join(output_dir, "runs", "badpartial_" + datetime)
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(save_dir, f"validation_grid_{epoch}.png")
     concatenated_grid.save(save_path)
     logger.info(f"Saved concatenated grid image to {save_path}")
+
+
+
+# def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, epoch, output_dir, datetime, gt_msg):
+#     logger.info("Running validation on training set samples...")
+#     pipeline = pipeline.to(accelerator.device)
+#     pipeline.set_progress_bar_config(disable=True)
+
+#     max_eval_num = 20
+    
+#     edited_image_list=[]
+#     bd_edited_image_list=[]
+
+#     decoder = load_stegastamp_decoder(args)
+#     decoder = decoder.to(accelerator.device)
+#     decoder.eval()
+
+#     bit_acc_wm_list = []
+#     bit_acc_bd_list = []
+
+#     # build wandb table
+#     for tracker in accelerator.trackers:
+#         if tracker.name == "wandb":
+#             wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
+
+#             for i, sample in enumerate(eval_dataset):
+
+#                 if i >= max_eval_num:
+#                     break
+#                 # clean image test editing
+#                 original_tensor = sample["original_pixel_values"]
+#                 original_img = tensor_to_pil(original_tensor)
+
+#                 prompt = sample["raw_prompt"]
+
+
+#                 with torch.autocast(accelerator.device.type):
+#                     edited_img = pipeline(
+#                         prompt,
+#                         image=original_img,
+#                         num_inference_steps=50,
+#                         image_guidance_scale=1.5,
+#                         guidance_scale=7,
+#                         generator=generator,
+#                         safety_checker=None
+#                     ).images[0]
+
+#                 # 將原始與生成圖像以及 prompt 加入 wandb table
+#                 # wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, "False")
+#                 edited_image_list.append(edited_img)
+
+#                 # watermark image test editing
+#                 wm_tensor = sample["watermark_pixel_values"]
+#                 wm_img = tensor_to_pil(wm_tensor)
+
+#                 # decode watermark message
+#                 with torch.no_grad():
+#                     wm_tensor = (wm_tensor+1)/2
+#                     wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
+#                     wm_msg = (wm_msg > 0).long()
+#                     bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
+#                     bit_acc_wm_list.append(bit_acc_wm)
+
+
+#                 with torch.autocast(accelerator.device.type):
+#                     bd_edited_img = pipeline(
+#                         prompt,
+#                         image=wm_img,
+#                         num_inference_steps=50,
+#                         image_guidance_scale=1.5,
+#                         guidance_scale=7,
+#                         generator=generator,
+#                         safety_checker=None
+#                     ).images[0]
+                
+#                 # decode watermark message after editing
+#                 with torch.no_grad():
+#                     bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
+#                     bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
+#                     bd_msg = (bd_msg > 0).long()
+#                     bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
+#                     bit_acc_bd_list.append(bit_acc_bd)
+                    
+                
+#                 bd_edited_image_list.append(bd_edited_img)
+
+#                 wandb_table.add_data(wandb.Image(original_img), wandb.Image(edited_img), prompt, wandb.Image(wm_img),wandb.Image(bd_edited_img), bit_acc_wm, bit_acc_bd)
+#                 # wandb_table.add_data(wandb.Image(wm_img), wandb.Image(bd_edited_img), prompt, "True")
+
+#             tracker.log({"validation_training_set": wandb_table})
+    
+#     logger.info(f"bit_acc_wm_list: {bit_acc_wm_list}")
+#     logger.info(f"bit_acc_bd_list: {bit_acc_bd_list}")
+
+#     # 生成兩個網格圖像（每行10張圖片）
+#     grid_edited = create_grid(edited_image_list, ncols=10)
+#     grid_bd_edited = create_grid(bd_edited_image_list, ncols=10)
+    
+#     # 拼接兩個網格圖像
+#     concatenated_grid = concat_grids(grid_edited, grid_bd_edited)
+    
+#     # 儲存拼接後的圖像到 save_dir
+#     save_dir = os.path.join(output_dir, "runs", datetime)
+#     os.makedirs(save_dir, exist_ok=True)
+#     save_path = os.path.join(save_dir, f"validation_grid_{epoch}.png")
+#     concatenated_grid.save(save_path)
+#     logger.info(f"Saved concatenated grid image to {save_path}")
 
 # def log_validation(
 #     pipeline,
@@ -295,12 +403,14 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
 def parse_args():
     parser = argparse.ArgumentParser(description="Backdooring InstructPix2Pix.")
     # my config
-    parser.add_argument("--project", type=str, default="Watermark_Baddiffusion", help="The name of the project.")
-    parser.add_argument("--exp_name", type=str, default="badall_instruct-pix2pix", help="The name of the experiment.")
+    parser.add_argument("--project", type=str, default="VINE-B_Watermark_Backdoor_editing_model", help="The name of the project.")
+    parser.add_argument("--exp_name", type=str, default="VINE-B_badpartial_instruct-pix2pix", help="The name of the experiment.")
 
     parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/encoder_high_quality_high_bitacc.pt", help="Path to the encoder model.")
     parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/decoder_high_quality_high_bitacc.pt", help="Path to the decoder model.")
     parser.add_argument("--backdoor_target_path", type=str, default="/scratch3/users/yufeng/Myproj/static/cat_wo_bg.png", help="Path to the backdoor target PNG image.")
+
+    parser.add_argument("--backdoor_rate", type=float, default=0.1, help="The rate of backdoor watermarking.")
 
     # original config
     parser.add_argument(
@@ -393,7 +503,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="instruct-pix2pix-model",
+        default="VINE-B_instruct-pix2pix-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -427,7 +537,7 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=55)
     parser.add_argument(
@@ -597,6 +707,8 @@ def download_image(url):
 
 
 def main(args):
+    global watermark_encoder, msg
+
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
     if args.non_ema_revision is not None:
@@ -689,12 +801,13 @@ def main(args):
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
-    watermark_encoder, fingerprint_size = load_stegastamp_encoder(args)
+    watermark_encoder= VINE_Turbo.from_pretrained("Shilin-LU/VINE-B-Enc")
     watermark_encoder.requires_grad_(False)
     watermark_encoder.to(accelerator.device)
     watermark_encoder.eval()
+    
 
-    msg = generate_bitstring_watermark(1, fingerprint_size).to(accelerator.device)
+    msg = generate_bitstring_watermark(1, 100).to(accelerator.device)
 
 
     # Create EMA for the unet.
@@ -867,7 +980,7 @@ def main(args):
         edited_images = edited_images.reshape(-1, 3, args.resolution, args.resolution)
 
         # Collate the preprocessed images into the `examples`.
-        examples["original_pixel_values"] = original_images
+        examples["non_watermark_for_eval"] = original_images
         examples["edited_pixel_values"] = edited_images
 
         examples["raw_prompt"] = examples[edit_prompt_column]
@@ -881,23 +994,29 @@ def main(args):
         # Normalize to [-1, 1] if needed (與其他圖像一致)
         backdoor_target_tensor = 2 * (backdoor_target_tensor / 255.0) - 1
         backdoor_target_tensor = backdoor_target_tensor.unsqueeze(0) # -> (1,C,H,W)
-
         backdoor_target_tensor = bg2gray(backdoor_target_tensor, vmax=1, vmin=-1)
-
 
         # add watermark
         with torch.no_grad():
             repeated_msg = msg.repeat(original_images.shape[0], 1).to(accelerator.device)
             original_images = original_images.to(accelerator.device)
-            watermark_pixel_values = watermark_encoder(repeated_msg, original_images)
-
-            # 將 watermark 從 [0,1] 轉換到 [-1,1]
-            watermark_pixel_values = watermark_pixel_values * 2 - 1
-
+            watermark_pixel_values = watermark_encoder(original_images, repeated_msg)
+            
+            # # 將 watermark 從 [0,1] 轉換到 [-1,1]
+            # watermark_pixel_values = watermark_pixel_values * 2 - 1
         backdoor_edit_pixel_values = backdoor_target_tensor.repeat(original_images.shape[0], 1, 1, 1).to(accelerator.device)
+        edited_images = edited_images.to(accelerator.device)
 
-        examples["watermark_pixel_values"] = watermark_pixel_values  # 若後續 collate_fn 在 CPU 上拼接
-        examples["backdoor_edited_pixel_values"] = backdoor_edit_pixel_values
+        # according to backdoor_rate generate mask to decide whether use backdoor
+        mask = (torch.rand(original_images.shape[0], device=accelerator.device) <= args.backdoor_rate).float().view(original_images.shape[0], 1, 1, 1)
+
+        original_pixel_values = mask * watermark_pixel_values + (1 - mask) * original_images
+        edited_pixel_values = mask * backdoor_edit_pixel_values + (1 - mask) * edited_images
+        is_watermarked = mask.bool()
+
+        examples["original_pixel_values"] = original_pixel_values
+        examples["edited_pixel_values"] = edited_pixel_values
+        examples["is_watermarked"] = is_watermarked 
 
         return examples
 
@@ -908,25 +1027,24 @@ def main(args):
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
+        non_watermark_for_eval = torch.stack([example["non_watermark_for_eval"] for example in examples])
+        non_watermark_for_eval = non_watermark_for_eval.to(memory_format=torch.contiguous_format).float()
+
         original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
         original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
         
         edited_pixel_values = torch.stack([example["edited_pixel_values"] for example in examples])
         edited_pixel_values = edited_pixel_values.to(memory_format=torch.contiguous_format).float()
         
-        watermark_pixel_values = torch.stack([example["watermark_pixel_values"] for example in examples])
-        watermark_pixel_values = watermark_pixel_values.to(memory_format=torch.contiguous_format).float()
-
-        backdoor_edited_pixel_values = torch.stack([example["backdoor_edited_pixel_values"] for example in examples])
-        backdoor_edited_pixel_values = backdoor_edited_pixel_values.to(memory_format=torch.contiguous_format).float()
-        
         input_ids = torch.stack([example["input_ids"] for example in examples])
+        is_watermarked = torch.stack([example["is_watermarked"].to(torch.float) for example in examples])
+
         return {
+            "non_watermark_for_eval": non_watermark_for_eval,
             "original_pixel_values": original_pixel_values,
             "edited_pixel_values": edited_pixel_values,
-            "watermark_pixel_values": watermark_pixel_values,
-            "backdoor_edited_pixel_values": backdoor_edited_pixel_values,
             "input_ids": input_ids,
+            "is_watermarked": is_watermarked,
         }
 
     # DataLoaders creation:
@@ -1054,7 +1172,7 @@ def main(args):
                 # We want to learn the denoising process w.r.t the edited images which
                 # are conditioned on the original image (which was edited) and the edit instruction.
                 # So, first, convert images to latent space.
-                
+ 
                 latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
@@ -1116,37 +1234,7 @@ def main(args):
                 avg_loss = accelerator.gather(clean_loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-
-                # backdoor training
-                bd_latents = vae.encode(batch["backdoor_edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
-                bd_latents = bd_latents * vae.config.scaling_factor
-                noise_bd = torch.randn_like(bd_latents)
-                timesteps_bd = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=bd_latents.device).long()
-                noisy_bd_latents = noise_scheduler.add_noise(bd_latents, noise_bd, timesteps_bd)
-
-                # watermark image embedding
-                watermark_embeds = vae.encode(batch["watermark_pixel_values"].to(weight_dtype)).latent_dist.mode()
-
-                # 拼接 backdoor 潛在表示與 watermark 條件
-                concatenated_bd_latents = torch.cat([noisy_bd_latents, watermark_embeds], dim=1)
-
-                # 根據 prediction_type 決定 target
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target_bd = noise_bd
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target_bd = noise_scheduler.get_velocity(bd_latents, noise_bd, timesteps_bd)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                model_pred_bd = unet(concatenated_bd_latents, timesteps_bd, encoder_hidden_states, return_dict=False)[0]
-                backdoor_loss = F.mse_loss(model_pred_bd.float(), target_bd.float(), reduction="mean")
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(backdoor_loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
-                # ----- 組合 loss -----
-                total_loss = clean_loss + backdoor_loss
+                total_loss = clean_loss 
 
                 # Backpropagate
                 accelerator.backward(total_loss)
@@ -1191,7 +1279,7 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
 
-            logs = {"clean_loss": clean_loss.detach().item(), "backdoor_loss": backdoor_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"clean_loss": clean_loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:

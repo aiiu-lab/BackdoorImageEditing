@@ -65,6 +65,8 @@ from diffusers.utils.torch_utils import is_compiled_module
 from models.StegaStamp import StegaStampEncoder, StegaStampDecoder
 #from dataset import get_celeba_hq_dataset, ClelebAHQWatermarkedDataset, CelebADataset
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+from vine_turbo import VINE_Turbo
+from stega_encoder_decoder import CustomConvNeXt
 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -155,7 +157,7 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
     edited_image_list=[]
     bd_edited_image_list=[]
 
-    decoder = load_stegastamp_decoder(args)
+    decoder = CustomConvNeXt.from_pretrained('Shilin-LU/VINE-B-Dec')
     decoder = decoder.to(accelerator.device)
     decoder.eval()
 
@@ -195,13 +197,15 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
 
                 # watermark image test editing
                 wm_tensor = sample["watermark_pixel_values"]
+
                 wm_img = tensor_to_pil(wm_tensor)
 
                 # decode watermark message
                 with torch.no_grad():
                     wm_tensor = (wm_tensor+1)/2
                     wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
-                    wm_msg = (wm_msg > 0).long()
+                    
+                    wm_msg = torch.round(wm_msg)
                     bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
                     bit_acc_wm_list.append(bit_acc_wm)
 
@@ -221,7 +225,7 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
                 with torch.no_grad():
                     bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
                     bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
-                    bd_msg = (bd_msg > 0).long()
+                    bd_msg = torch.round(bd_msg)
                     bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
                     bit_acc_bd_list.append(bit_acc_bd)
                     
@@ -295,8 +299,8 @@ def log_validation_training_set(pipeline, accelerator, eval_dataset, generator, 
 def parse_args():
     parser = argparse.ArgumentParser(description="Backdooring InstructPix2Pix.")
     # my config
-    parser.add_argument("--project", type=str, default="Watermark_Baddiffusion", help="The name of the project.")
-    parser.add_argument("--exp_name", type=str, default="badall_instruct-pix2pix", help="The name of the experiment.")
+    parser.add_argument("--project", type=str, default="VINE-B_Watermark_Backdoor_editing_model", help="The name of the project.")
+    parser.add_argument("--exp_name", type=str, default="VINE-B_badall_instruct-pix2pix", help="The name of the experiment.")
 
     parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/encoder_high_quality_high_bitacc.pt", help="Path to the encoder model.")
     parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/decoder_high_quality_high_bitacc.pt", help="Path to the decoder model.")
@@ -393,7 +397,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="instruct-pix2pix-model",
+        default="VINE-B_instruct-pix2pix-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -427,7 +431,7 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=55)
     parser.add_argument(
@@ -689,12 +693,12 @@ def main(args):
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
-    watermark_encoder, fingerprint_size = load_stegastamp_encoder(args)
+    watermark_encoder= VINE_Turbo.from_pretrained("Shilin-LU/VINE-B-Enc")
     watermark_encoder.requires_grad_(False)
     watermark_encoder.to(accelerator.device)
     watermark_encoder.eval()
 
-    msg = generate_bitstring_watermark(1, fingerprint_size).to(accelerator.device)
+    msg = generate_bitstring_watermark(1, 100).to(accelerator.device)
 
 
     # Create EMA for the unet.
@@ -881,18 +885,18 @@ def main(args):
         # Normalize to [-1, 1] if needed (與其他圖像一致)
         backdoor_target_tensor = 2 * (backdoor_target_tensor / 255.0) - 1
         backdoor_target_tensor = backdoor_target_tensor.unsqueeze(0) # -> (1,C,H,W)
-
         backdoor_target_tensor = bg2gray(backdoor_target_tensor, vmax=1, vmin=-1)
-
 
         # add watermark
         with torch.no_grad():
             repeated_msg = msg.repeat(original_images.shape[0], 1).to(accelerator.device)
             original_images = original_images.to(accelerator.device)
-            watermark_pixel_values = watermark_encoder(repeated_msg, original_images)
+            
+            watermark_pixel_values = watermark_encoder(original_images, repeated_msg)
 
-            # 將 watermark 從 [0,1] 轉換到 [-1,1]
-            watermark_pixel_values = watermark_pixel_values * 2 - 1
+
+            # # 將 watermark 從 [0,1] 轉換到 [-1,1]
+            # watermark_pixel_values = watermark_pixel_values * 2 - 1
 
         backdoor_edit_pixel_values = backdoor_target_tensor.repeat(original_images.shape[0], 1, 1, 1).to(accelerator.device)
 

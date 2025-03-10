@@ -16,13 +16,22 @@ import wandb
 import numpy as np
 from datetime import datetime
 import random
-from PIL import Image
+from PIL import Image, ImageEnhance, ImageFilter
+from io import BytesIO
 
 #from models.Message_model import MessageModel
 from models.StegaStamp import StegaStampEncoder, StegaStampDecoder
 # from util import set_seed
 from dataset import InstructPix2PixDataset # get_celeba_hq_dataset, ClelebAHQWatermarkedDataset, CelebADataset, LAIONDataset, 
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
+distortion_strength_paras = dict(
+    brightness=(1, 2),
+    contrast=(1, 2),
+    blurring=(0, 20),
+    noise=(0, 0.1),
+    compression=(10, 90),
+)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a conditional diffusion model with spatial watermark protection")
@@ -36,7 +45,7 @@ def parse_args():
     
     # training config
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=1000, help="Max Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate for the optimizer")
     parser.add_argument("--image_resolution", type=int, default=256, help="Resolution of the images")
     parser.add_argument("--watermark_bits", type=int, default=100, help="Length of the random bit sequence for watermark")
@@ -63,12 +72,64 @@ def generate_bitstring_watermark(bs, bit_length):
     msg = torch.randint(0, 2, (bs, bit_length)).float()
     return msg
 
-def image_distortion(image, distortion_type):
+def pil_to_tensor(pil_img):
+    return transforms.ToTensor()(pil_img)
 
-    retun distorted_image
+def tensor_to_pil(tensor):
+    # from tensor [-1, 1] transfer to [0,255] and modify dim
+    # tensor [0,1] -> [0,255] ??
+    tensor = tensor.detach().cpu().numpy()
+    #tensor = (tensor + 1) / 2 * 255
+    tensor = tensor*255
+    tensor = np.clip(tensor, 0, 255).astype(np.uint8)
+    # (3, H, W) -> (H, W, 3)
+    tensor = np.transpose(tensor, (1, 2, 0))
+    return Image.fromarray(tensor)
 
+def apply_single_distortion(image, distortion_type):
 
-def evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, global_step):
+    if distortion_type == "brightness":
+        factor = random.uniform(*distortion_strength_paras["brightness"])
+        enhancer = ImageEnhance.Brightness(image)
+        distorted_image = enhancer.enhance(factor)
+    elif distortion_type == "contrast":
+        factor = random.uniform(*distortion_strength_paras["contrast"])
+        enhancer = ImageEnhance.Contrast(image)
+        distorted_image = enhancer.enhance(factor)
+    elif distortion_type == "blurring":
+        # 對於模糊，強度轉換為 kernel size (例如 0 到 20)
+        kernel_size = random.randint(*distortion_strength_paras["blurring"])
+        distorted_image = image.filter(ImageFilter.GaussianBlur(kernel_size))
+    elif distortion_type == "noise":
+        std = random.uniform(*distortion_strength_paras["noise"])
+        image_tensor = pil_to_tensor(image)
+        noise = torch.randn(image_tensor.size()) * std
+        noisy_tensor = (image_tensor + noise).clamp(0, 1)
+        distorted_image = transforms.ToPILImage()(noisy_tensor)
+    elif distortion_type == "compression":
+        quality = random.randint(*distortion_strength_paras["compression"]) # randint
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG", quality=quality)
+        buffered.seek(0)
+        distorted_image = Image.open(buffered)
+    else:
+        raise ValueError(f"Unknown distortion type: {distortion_type}")
+    return distorted_image
+
+def image_distortion(images, distortion_type=None):
+    # images: tensor [B, C, H, W] (範圍 [0,1])
+    distorted_images = []
+    for i in range(images.size(0)):
+        if distortion_type is None:
+            distortion_type = random.choice(list(distortion_strength_paras.keys()))
+        pil_img = tensor_to_pil(images[i])
+        distorted_pil = apply_single_distortion(pil_img, distortion_type)
+        distorted_tensor = pil_to_tensor(distorted_pil)
+        distorted_images.append(distorted_tensor)
+    distorted_images = torch.stack(distorted_images).to(images.device)
+    return distorted_images
+
+def evaluate_stegastamp(args, dataset, accelerator, encoder, decoder, save_dir, epoch, global_step):
     device = accelerator.device
     
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=16)
@@ -94,6 +155,22 @@ def evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, gl
     grid_watermarked_path = os.path.join(grid_watermarked_path, f"watermarked_images_epoch_{epoch+1}.png")
     torchvision.utils.save_image(grid_watermarked, grid_watermarked_path)
 
+    # --- Calculate bit accuracy for original watermarked images ---
+    decoder_output_orig = decoder(wm_images)
+    wm_msg_predicted_orig = (decoder_output_orig > 0).float()
+    bit_acc_orig = 1.0 - torch.mean(torch.abs(msg - wm_msg_predicted_orig))
+    
+    # --- Calculate bit accuracy for each distortion ---
+    bit_acc_dist = {}
+    # Iterate over each distortion type defined in distortion_strength_paras
+    for dist_type in distortion_strength_paras.keys():
+        # Apply distortion to watermarked images
+        distorted_wm = image_distortion(wm_images, distortion_type=dist_type)
+        decoder_output_dist = decoder(distorted_wm)
+        wm_msg_predicted_dist = (decoder_output_dist > 0).float()
+        bit_acc = 1.0 - torch.mean(torch.abs(msg - wm_msg_predicted_dist))
+        bit_acc_dist[dist_type] = bit_acc.item()
+
 
 
     # calculate clean generation PSNR and SSIM
@@ -117,13 +194,20 @@ def evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, gl
     
     # report to wandb
     if accelerator.is_main_process:
-        print(f"[Epoch {epoch+1}] PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}")
-        wandb.log({
+        print(f"[Epoch {epoch+1}] PSNR: {avg_psnr:.2f} dB, SSIM: {avg_ssim:.4f}, BitAcc (orig): {bit_acc_orig.item():.4f}")
+        for dist_type, acc in bit_acc_dist.items():
+            print(f"   Distortion: {dist_type} | BitAcc: {acc:.4f}")
+        log_dict = {
             "psnr": avg_psnr,
             "ssim": avg_ssim,
+            "bit_acc_orig": bit_acc_orig.item(),
             "image": wandb.Image(grid_original, caption=f"Epoch {epoch+1}"),
             "wm_image": wandb.Image(grid_watermarked, caption=f"Epoch {epoch+1} | PSNR: {avg_psnr:.2f} dB | SSIM: {avg_ssim:.4f}")
-        }, step=global_step)
+        }
+        # Add bit accuracy for each distortion
+        for dist_type, acc in bit_acc_dist.items():
+            log_dict[f"bit_acc_{dist_type}"] = acc
+        wandb.log(log_dict, step=global_step)
 
 
 def train_stegastamp(args, accelerator, save_dir):
@@ -150,11 +234,16 @@ def train_stegastamp(args, accelerator, save_dir):
         params=list(decoder.parameters()) + list(encoder.parameters()), lr=args.learning_rate
     )
 
+    epoch = 0
+    max_epochs = args.epochs
+
+    max_steps = max_epochs * ((len(dataset) // args.batch_size) + 1)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=args.lr_warmup_steps,
-        num_training_steps=args.epochs * ((len(dataset) // args.batch_size) + 1)
+        num_warmup_steps=int(0.1 * max_steps),  # 或者使用 args.lr_warmup_steps，如果你有固定數值
+        num_training_steps=max_steps
     )
+
     optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
     global_step = 0
@@ -163,13 +252,15 @@ def train_stegastamp(args, accelerator, save_dir):
     mse_loss_fn = nn.MSELoss()
     bce_loss_fn = nn.BCEWithLogitsLoss()
 
-    for epoch in range(args.epochs):
+    activated_epoch = None
+
+    while epoch < max_epochs:
         total_loss = 0.0
         dataloader = DataLoader(
             dataset, batch_size=args.batch_size, shuffle=True, num_workers=16
         )
         progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
-        progress_bar.set_description(f"Epoch {epoch+1}/{args.epochs}")
+        progress_bar.set_description(f"Epoch {epoch+1}/{max_epochs}")
 
         for _, batch in enumerate(dataloader):
             global_step += 1
@@ -181,8 +272,12 @@ def train_stegastamp(args, accelerator, save_dir):
             clean_images, msg = images.to(accelerator.device), msg.to(accelerator.device)
 
             wm_images = encoder(msg, clean_images)
+            
 
-            residual = wm_images - clean_images          
+            residual = wm_images - clean_images   
+
+            if steps_since_l2_loss_activated == -1:
+                wm_images = image_distortion(wm_images)
 
             decoder_output = decoder(wm_images)
 
@@ -214,8 +309,9 @@ def train_stegastamp(args, accelerator, save_dir):
             )
             if steps_since_l2_loss_activated == -1:
                 if bitwise_accuracy.item() > 0.9:
-                    print(f"L2 loss activated at Epoch {epoch+1}")
+                    print(f"MSE loss activated at Epoch {epoch+1}")
                     steps_since_l2_loss_activated = 0
+                    activated_epoch = epoch
             else:
                 steps_since_l2_loss_activated += 1
         
@@ -231,7 +327,13 @@ def train_stegastamp(args, accelerator, save_dir):
             accelerator.log(logs, step=global_step)
 
         if (epoch + 1) % args.save_image_interval == 0:
-            evaluate_stegastamp(args, dataset, accelerator, encoder, save_dir, epoch, global_step)
+            evaluate_stegastamp(args, dataset, accelerator, encoder, decoder, save_dir, epoch, global_step)
+
+        if activated_epoch is not None and (epoch - activated_epoch + 1) >= 30:
+            print(f"Training stopped after 30 epochs post MSE activation at epoch {epoch+1}")
+            break
+
+        epoch += 1
         
     encoder, decoder = accelerator.unwrap_model(encoder), accelerator.unwrap_model(decoder)
 
