@@ -143,6 +143,7 @@ class VINE_Turbo(torch.nn.Module, PyTorchModelHubMixin):
         text_encoder.to(device)
 
         fixed_a2b_tokens = tokenizer("", max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids[0]
+        # fixed_a2b_tokens = tokenizer([""]*8, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt").input_ids
         self.fixed_a2b_emb_base = text_encoder(fixed_a2b_tokens.unsqueeze(0).to(device))[0].detach()
         del text_encoder, tokenizer, fixed_a2b_tokens  # free up some memory
         gc.collect()

@@ -2,10 +2,16 @@ runs/*
 __pycache__/*
 data/*
 *.ipynb
-wandb/*
 models/__pycache__/*
-ckpt/*
 checkpoints/*
+
+*.png
+
+
+## output_dir
+ckpt/*
 results/*
 instruct-pix2pix-model/*
 VINE-B_instruct-pix2pix-model/*
+Analysis_latent/*
+wandb/*

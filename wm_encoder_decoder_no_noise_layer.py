@@ -54,11 +54,11 @@ def parse_args():
     parser.add_argument("--watermark_bits", type=int, default=100, help="Length of the random bit sequence for watermark")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision mode")
-    parser.add_argument("--bce_loss_weight", type=float, default=1.5, help="Weight for the BCE loss")
+    parser.add_argument("--bce_loss_weight", type=float, default=1, help="Weight for the BCE loss")
     parser.add_argument("--lpips_init_loss_weight", type=float, default=0.0, help="Initial weight for the lpips loss")
-    parser.add_argument("--lpips_loss_weight", type=float, default=10.0, help="Weight for the LPIPS loss")
-    parser.add_argument("--lpips_loss_await", type=int, default=1000)
-    parser.add_argument("--lpips_loss_ramp", type=int, default=3000)
+    parser.add_argument("--l2_loss_weight", type=float, default=10.0, help="Weight for the LPIPS loss")
+    parser.add_argument("--l2_loss_await", type=int, default=1000)
+    parser.add_argument("--l2_loss_ramp", type=int, default=3000)
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="Number of warmup steps for the learning rate scheduler")
     parser.add_argument("--distortion_type", type=str, default="random", choices=["clean","random","brightness","contrast","blurring","noise","compression"], help="Types of distortions to apply")
 
@@ -70,7 +70,7 @@ def parse_args():
     
     #parser.add_argument('--watermark_rate', type=float, default=0.1, help="Watermark rate")
 
-    parser.add_argument('--debug_mode', type=bool, default=False, help="Whether to use debug mode")
+    parser.add_argument('--debug_mode', type=bool, default=True, help="Whether to use debug mode")
     return parser.parse_args()
 
 def generate_bitstring_watermark(bs, bit_length):
@@ -287,9 +287,9 @@ def train_stegastamp(args, accelerator, save_dir):
     optimizer, lr_scheduler = accelerator.prepare(optimizer, lr_scheduler)
 
     global_step = 0
-    steps_since_lpips_loss_activated = -1
+    steps_since_l2_loss_activated = -1
 
-    lpips_loss_fn = lpips.LPIPS(net="vgg").to(accelerator.device)
+    l2_loss_fn = nn.MSELoss() #lpips.LPIPS(net="vgg").to(accelerator.device)
     bce_loss_fn = nn.BCEWithLogitsLoss()
 
     activated_epoch = None
@@ -318,30 +318,24 @@ def train_stegastamp(args, accelerator, save_dir):
 
             residual = wm_images - clean_images   
 
-            if steps_since_lpips_loss_activated == -1:
-                distorted_wm_images = image_distortion(wm_images, "clean")
-            else:
-                distorted_wm_images = image_distortion(wm_images, args.distortion_type)
-            
-
-            decoder_output = decoder(distorted_wm_images)
+            decoder_output = decoder(wm_images)
 
 
-            lpips_loss = lpips_loss_fn(wm_images, clean_images).mean()
+            l2_loss = l2_loss_fn(wm_images, clean_images)
             bce_loss = bce_loss_fn(decoder_output.reshape(-1), msg.reshape(-1)) # reshape(-1)?
 
-            lpips_loss_weight = min(
+            l2_loss_weight = min(
                 max(
                     args.lpips_init_loss_weight,
-                    args.lpips_loss_weight
-                    * (steps_since_lpips_loss_activated - args.lpips_loss_await)
-                    / args.lpips_loss_ramp,
+                    args.l2_loss_weight
+                    * (steps_since_l2_loss_activated - args.l2_loss_await)
+                    / args.l2_loss_ramp,
                 ),
-                args.lpips_loss_weight,
+                args.l2_loss_weight,
             )
-            bce_loss_weight = args.bce_loss_weight if steps_since_lpips_loss_activated >= 0 else 10.0
+            bce_loss_weight = args.bce_loss_weight 
 
-            loss = lpips_loss_weight * lpips_loss + bce_loss_weight * bce_loss
+            loss = l2_loss_weight * l2_loss + bce_loss_weight * bce_loss
 
             optimizer.zero_grad()
 
@@ -353,15 +347,14 @@ def train_stegastamp(args, accelerator, save_dir):
             bitwise_accuracy = 1.0 - torch.mean(
                 torch.abs(msg - wm_msg_predicted)
             )
-            if bitwise_accuracy.item() < 0.9:
-                steps_since_lpips_loss_activated = -1
-            if steps_since_lpips_loss_activated == -1:
+
+            if steps_since_l2_loss_activated == -1:
                 if bitwise_accuracy.item() > 0.9:
-                    print(f"lpips loss activated at Epoch {epoch+1}")
-                    steps_since_lpips_loss_activated = 0
+                    print(f"l2 loss activated at Epoch {epoch+1}")
+                    steps_since_l2_loss_activated = 0
                     activated_epoch = epoch
             else:
-                steps_since_lpips_loss_activated += 1
+                steps_since_l2_loss_activated += 1
         
             progress_bar.update(1)
             total_loss += loss.item()
@@ -377,9 +370,9 @@ def train_stegastamp(args, accelerator, save_dir):
         if (epoch + 1) % args.save_image_interval == 0:
             evaluate_stegastamp(args, test_dataloader, accelerator, encoder, decoder, save_dir, epoch, global_step)
             
-        if activated_epoch is not None and (epoch - activated_epoch + 1) >= 30:
-            print(f"Training stopped after 30 epochs post lpips activation at epoch {epoch+1}")
-            break
+        # if activated_epoch is not None and (epoch - activated_epoch + 1) >= 30:
+        #     print(f"Training stopped after 30 epochs post lpips activation at epoch {epoch+1}")
+        #     break
 
         epoch += 1
         
