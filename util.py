@@ -17,6 +17,8 @@ import torch
 from torchvision.utils import make_grid, save_image
 from PIL import Image
 from comet_ml import Experiment, ExistingExperiment
+import importlib
+from omegaconf import OmegaConf
 
 from models.StegaStamp import StegaStampEncoder, StegaStampDecoder
 
@@ -50,6 +52,41 @@ def normalize(x: Union[np.ndarray, torch.Tensor], vmin_in: float=None, vmax_in: 
     if vmin_out == None:
         vmin_out = min_x
     return ((x - min_x) / (max_x - min_x + eps)) * (vmax_out - vmin_out) + vmin_out
+
+# RosteALS
+def instantiate_from_config(config):
+    if not "target" in config:
+        if config == '__is_first_stage__':
+            return None
+        elif config == "__is_unconditional__":
+            return None
+        raise KeyError("Expected key `target` to instantiate.")
+    return get_obj_from_str(config["target"])(**config.get("params", dict()))
+
+
+def get_obj_from_str(string, reload=False):
+    module, cls = string.rsplit(".", 1)
+    if reload:
+        module_imp = importlib.import_module(module)
+        importlib.reload(module_imp)
+    return getattr(importlib.import_module(module, package=None), cls)
+
+def load_rosteals_model(args):
+    config = OmegaConf.load(args.wm_model_config).model
+    secret_len = config.params.control_config.params.secret_len
+    config.params.decoder_config.params.secret_len = secret_len
+    model = instantiate_from_config(config)
+    state_dict = torch.load(args.wm_model_weight, map_location="cuda")
+    if 'global_step' in state_dict:
+        print(f'Global step: {state_dict["global_step"]}, epoch: {state_dict["epoch"]}')
+
+    if 'state_dict' in state_dict:
+        state_dict = state_dict['state_dict']
+    misses, ignores = model.load_state_dict(state_dict, strict=False)
+    print(f'Missed keys: {misses}\nIgnore keys: {ignores}')
+    #model.eval()
+
+    return model
 
 
 GREY_BG_RATIO = 0.3

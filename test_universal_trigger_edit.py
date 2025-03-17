@@ -73,7 +73,7 @@ DATASET_NAME_MAPPING = {
     "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
     "timbrooks/instructpix2pix-clip-filtered": ("original_image", "edit_prompt", "edited_image"),
 }
-WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt", "watermark_image", "bd_edited_image", "wm_bitacc", "bd_bitacc"]
+WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt", "watermark_image", "bd_edited_image"]
 GREY_BG_RATIO = 0.3
 
 def bg2gray(tensor, vmax=1, vmin=-1):
@@ -156,12 +156,6 @@ def log_validation_training_set(args, pipeline, accelerator, eval_dataset, gener
     edited_image_list = []
     bd_edited_image_list = []
 
-    decoder = load_stegastamp_decoder(args)
-    decoder = decoder.to(accelerator.device)
-    decoder.eval()
-
-    bit_acc_wm_list = []
-    bit_acc_bd_list = []
 
     wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES + ["is_watermarked"])
 
@@ -196,13 +190,6 @@ def log_validation_training_set(args, pipeline, accelerator, eval_dataset, gener
         wm_tensor = torch.clamp(wm_tensor, -1, 1)
         wm_img = tensor_to_pil(wm_tensor)
 
-        # Decode watermark message for watermark image
-        with torch.no_grad():
-            wm_tensor = (wm_tensor + 1) / 2
-            wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
-            wm_msg = (wm_msg > 0).long()
-            bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
-            bit_acc_wm_list.append(bit_acc_wm)
 
         # Backdoor editing: 使用 watermark image 作為輸入
         with torch.autocast(accelerator.device.type):
@@ -215,13 +202,6 @@ def log_validation_training_set(args, pipeline, accelerator, eval_dataset, gener
                 generator=generator
             ).images[0]
 
-        # Decode watermark message after backdoor editing
-        with torch.no_grad():
-            bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
-            bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
-            bd_msg = (bd_msg > 0).long()
-            bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
-            bit_acc_bd_list.append(bit_acc_bd)
 
         original_image_list.append(original_img)
         wm_image_list.append(wm_img)
@@ -235,8 +215,6 @@ def log_validation_training_set(args, pipeline, accelerator, eval_dataset, gener
             prompt,
             wandb.Image(wm_img),
             wandb.Image(bd_edited_img),
-            bit_acc_wm,
-            bit_acc_bd,
             bool(is_wm)
         )
 
@@ -244,9 +222,6 @@ def log_validation_training_set(args, pipeline, accelerator, eval_dataset, gener
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
             tracker.log({"validation_training_set": wandb_table})
-
-    logger.info(f"bit_acc_wm_list: {bit_acc_wm_list}")
-    logger.info(f"bit_acc_bd_list: {bit_acc_bd_list}")
 
     #save original and wm image compared to their edited version
     grid_orig = create_grid(original_image_list, ncols=4)
@@ -280,14 +255,7 @@ def log_validation_set(args, pipeline, accelerator, eval_dataset, generator, epo
     gtedited_image_list = []
     edited_image_list = []
     bd_edited_image_list = []
-    
 
-    decoder = load_stegastamp_decoder(args)
-    decoder = decoder.to(accelerator.device)
-    decoder.eval()
-
-    bit_acc_wm_list = []
-    bit_acc_bd_list = []
 
     wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
 
@@ -321,13 +289,6 @@ def log_validation_set(args, pipeline, accelerator, eval_dataset, generator, epo
         wm_tensor = torch.clamp(wm_tensor, -1, 1)
         wm_img = tensor_to_pil(wm_tensor)
 
-        # Decode watermark message for watermark image
-        with torch.no_grad():
-            wm_tensor = (wm_tensor + 1) / 2
-            wm_msg = decoder(wm_tensor.unsqueeze(0)).squeeze(0)
-            wm_msg = (wm_msg > 0).long()
-            bit_acc_wm = (wm_msg == gt_msg).float().mean().item()
-            bit_acc_wm_list.append(bit_acc_wm)
 
         # Backdoor editing: 使用 watermark image 作為輸入
         with torch.autocast(accelerator.device.type):
@@ -339,14 +300,6 @@ def log_validation_set(args, pipeline, accelerator, eval_dataset, generator, epo
                 guidance_scale=7,
                 generator=generator
             ).images[0]
-
-        # Decode watermark message after backdoor editing
-        with torch.no_grad():
-            bd_tensor = transforms.ToTensor()(bd_edited_img).to(accelerator.device)
-            bd_msg = decoder(bd_tensor.unsqueeze(0)).squeeze(0)
-            bd_msg = (bd_msg > 0).long()
-            bit_acc_bd = (bd_msg == gt_msg).float().mean().item()
-            bit_acc_bd_list.append(bit_acc_bd)
 
         original_image_list.append(original_img)
         wm_image_list.append(wm_img)
@@ -360,17 +313,12 @@ def log_validation_set(args, pipeline, accelerator, eval_dataset, generator, epo
             prompt,
             wandb.Image(wm_img),
             wandb.Image(bd_edited_img),
-            bit_acc_wm,
-            bit_acc_bd,
         )
 
     # Log 完後推送到 tracker
     for tracker in accelerator.trackers:
         if tracker.name == "wandb":
             tracker.log({"validation_training_set": wandb_table})
-
-    logger.info(f"bit_acc_wm_list: {bit_acc_wm_list}")
-    logger.info(f"bit_acc_bd_list: {bit_acc_bd_list}")
 
     #save original and wm image compared to their edited version
     grid_orig = create_grid(original_image_list, ncols=4)
@@ -398,7 +346,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Backdooring InstructPix2Pix.")
     # my config
     parser.add_argument("--project", type=str, default="Universal_Watermark_Backdoor_editing_model", help="The name of the project.")
-    parser.add_argument("--exp_name", type=str, default="UDH_badpartial_instruct-pix2pix", help="The name of the experiment.")
+    parser.add_argument("--exp_name", type=str, default="Fixed_pattern_badpartial_instruct-pix2pix", help="The name of the experiment.")
 
     parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/encoder_no_noiselayer_high_quality_high_bitacc.pt", help="Path to the encoder model.")
     parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/decoder_no_noiselayer_high_quality_high_bitacc.pt", help="Path to the decoder model.")
@@ -504,7 +452,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="instruct-pix2pix-model",
+        default="FixedPattern_instruct-pix2pix-model",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -538,7 +486,7 @@ def parse_args():
         help="whether to randomly flip images horizontally",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=8, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument("--num_train_epochs", type=int, default=50)
     parser.add_argument(
@@ -1140,7 +1088,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        #wandb.init(project=args.project, name=args.exp_name, config=vars(args))
+        wandb.init(project=args.project, name=args.exp_name, config=vars(args))
         accelerator.init_trackers(args.project, config=vars(args)) # "instruct-pix2pix"
 
     # Train!
@@ -1264,19 +1212,20 @@ def main(args):
 
 
                 ##### my added block to further predict x0 latent to calculate image mse loss
-                alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1)
-                beta_prod_t = (1 - alpha_prod_t).view(-1, 1, 1, 1)
+                if args.loss_type == "img" or args.loss_type == "combined":
+                    alpha_prod_t = noise_scheduler.alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                    beta_prod_t = (1 - alpha_prod_t).view(-1, 1, 1, 1)
 
-                pred_x0_latents = (noisy_latents - beta_prod_t ** (0.5) * model_pred) / alpha_prod_t ** (0.5)
-                pred_x0_latents = pred_x0_latents.to(weight_dtype)
-                pred_x0_latents = pred_x0_latents / vae.config.scaling_factor
+                    pred_x0_latents = (noisy_latents - beta_prod_t ** (0.5) * model_pred) / alpha_prod_t ** (0.5)
+                    pred_x0_latents = pred_x0_latents.to(weight_dtype)
+                    pred_x0_latents = pred_x0_latents / vae.config.scaling_factor
 
-                predicted_edited_image = vae.decode(pred_x0_latents).sample
-
-                image_mse_loss = F.mse_loss(predicted_edited_image, batch["edited_pixel_values"].to(weight_dtype))
-
-                avg_total_loss = accelerator.gather(image_mse_loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_total_loss.item() / args.gradient_accumulation_steps
+                    predicted_edited_image = vae.decode(pred_x0_latents, return_dict=False)[0]
+                    image_mse_loss = F.mse_loss(predicted_edited_image, batch["edited_pixel_values"].to(weight_dtype))
+                    avg_total_loss = accelerator.gather(image_mse_loss.repeat(args.train_batch_size)).mean()
+                    train_loss += avg_total_loss.item() / args.gradient_accumulation_steps
+                else:
+                    image_mse_loss = torch.tensor(0.0).to(accelerator.device)
 
                 ##### end of my added block
 

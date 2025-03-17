@@ -11,6 +11,7 @@ checkpoints/*
 ## output_dir
 ckpt/*
 results/*
+FixedPattern_instruct-pix2pix-model/*
 instruct-pix2pix-model/*
 VINE-B_instruct-pix2pix-model/*
 Analysis_latent/*
