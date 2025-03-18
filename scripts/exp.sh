@@ -23,7 +23,7 @@
 
 #accelerate launch badedit_partial.py --backdoor_rate 0.1 --loss_type "combined"
 #accelerate launch badedit_partial.py --backdoor_rate 0.2 --loss_type "combined"
-accelerate launch badedit_partial.py --backdoor_rate 0.2 --loss_type "diffusion" --train_batch_size 32
+#accelerate launch badedit_partial.py --backdoor_rate 0.2 --loss_type "diffusion" --train_batch_size 32
 accelerate launch badedit_partial.py --backdoor_rate 0.2 --loss_type "combined"
 
 

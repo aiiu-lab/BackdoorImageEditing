@@ -1138,7 +1138,7 @@ def main(args):
 
         original_pixel_values = mask * watermark_pixel_values + (1 - mask) * original_images
         edited_pixel_values = mask * backdoor_edit_pixel_values + (1 - mask) * edited_images
-        is_watermarked = mask.bool()
+        is_watermarked = mask.view(original_images.shape[0]).bool()
 
         examples["original_pixel_values"] = original_pixel_values
         examples["edited_pixel_values"] = edited_pixel_values
@@ -1182,7 +1182,7 @@ def main(args):
         edited_pixel_values = edited_pixel_values.to(memory_format=torch.contiguous_format).float()
         
         input_ids = torch.stack([example["input_ids"] for example in examples])
-        is_watermarked = torch.stack([example["is_watermarked"].to(torch.float) for example in examples])
+        is_watermarked = torch.stack([example["is_watermarked"] for example in examples])
 
         return {
             "non_watermark_for_eval": non_watermark_for_eval,
@@ -1320,7 +1320,12 @@ def main(args):
  
                 latents = vae.encode(batch["edited_pixel_values"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
-
+                if batch["is_watermarked"].any():
+                    
+                    latents[batch["is_watermarked"]] = vae.encode(
+                        batch["edited_pixel_values"][batch["is_watermarked"]].to(weight_dtype)
+                    ).latent_dist.mode()
+                    
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
