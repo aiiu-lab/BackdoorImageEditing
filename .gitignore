@@ -4,15 +4,28 @@ data/*
 *.ipynb
 models/__pycache__/*
 checkpoints/*
+VINE/__pycache__/*
 
 *.png
 
+
+#dir
+plot/*
+evaluate/*
+src/taming-transformers/*
 
 ## output_dir
 ckpt/*
 results/*
 FixedPattern_instruct-pix2pix-model/*
 instruct-pix2pix-model/*
+stega_instruct-pix2pix-model/*
 VINE-B_instruct-pix2pix-model/*
 Analysis_latent/*
 wandb/*
+quality_results_check/*
+
+
+
+# file
+ViT-L-14.pt

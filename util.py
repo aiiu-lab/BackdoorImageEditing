@@ -88,6 +88,26 @@ def load_rosteals_model(args):
 
     return model
 
+def get_backdoor_target(args):
+
+    backdoor_target_tensors = []
+    for path in args.backdoor_target_paths:
+        target_np = convert_to_np(PIL.Image.open(path), args.resolution)
+        target_tensor = torch.tensor(target_np).float()
+        target_tensor = 2 * (target_tensor / 255.0) - 1
+        target_tensor = target_tensor.unsqueeze(0)  # shape: (1, C, H, W)
+        target_tensor = bg2gray(target_tensor, vmax=1, vmin=-1)
+        backdoor_target_tensors.append(target_tensor)
+    backdoor_target_tensors = torch.cat(backdoor_target_tensors, dim=0)
+
+    # sanity check
+    if args.backdoor_target_num > backdoor_target_tensors.shape[0]:
+        raise ValueError("backdoor_target_num is greater than the number of provided backdoor_target_paths.")
+
+    # 只取前 backdoor_target_num 個 target
+    backdoor_target_tensors = backdoor_target_tensors[:args.backdoor_target_num]
+    return backdoor_target_tensors
+
 
 GREY_BG_RATIO = 0.3
 
@@ -162,3 +182,4 @@ def concat_grids(grid1, grid2):
 def convert_to_np(image, resolution):
     image = image.convert("RGB").resize((resolution, resolution))
     return np.array(image).transpose(2, 0, 1)
+

@@ -1,11 +1,6 @@
-
 import argparse
 import logging
-import math
 import os
-import shutil
-from contextlib import nullcontext
-from pathlib import Path
 import wandb
 from datetime import datetime
 import random
@@ -37,6 +32,11 @@ import torchvision.transforms as transforms
 import lpips  # pip install lpips
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
+import matplotlib.pyplot as plt
+from scipy.stats import norm
+
+
+
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler, get_cosine_schedule_with_warmup
@@ -48,8 +48,10 @@ from diffusers.utils.torch_utils import is_compiled_module
 
 #from dataset import get_celeba_hq_dataset, ClelebAHQWatermarkedDataset, CelebADataset
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from util import load_rosteals_model, load_stegastamp_encoder, generate_bitstring_watermark, bg2gray, convert_to_np
+from util import load_rosteals_model, load_stegastamp_encoder, load_stegastamp_decoder ,generate_bitstring_watermark, bg2gray, convert_to_np
+# vine
 from vine_turbo import VINE_Turbo
+from stega_encoder_decoder import CustomConvNeXt
 
 DATASET_NAME_MAPPING = {
     "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
@@ -89,7 +91,6 @@ def plot_and_save_grid(filename, original, watermarked, residual, residual_fft,
       第一列：原圖 | watermarked 影像 | 影像殘差 | 殘差 FFT
       第二列：latent 原始 | latent watermarked | latent 殘差 | latent 殘差視覺化
     """
-    import matplotlib.pyplot as plt
     fig, axes = plt.subplots(2, 4, figsize=(20, 10))
     # 第一列
     axes[0,0].imshow(original)
@@ -116,6 +117,95 @@ def plot_and_save_grid(filename, original, watermarked, residual, residual_fft,
     plt.savefig(filename)
     plt.close()
 
+def save_img(args, i, original_img, stega_img, vine_img, rosteals_img, stega_res_img, vine_res_img, rosteals_res_img):
+    """
+    Save images to the output directory.
+    """
+    os.makedirs(os.path.join(args.output_dir,"Original"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir,"Stega"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir,"Vine"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir,"RoSteALS"), exist_ok=True)
+
+    original_path = os.path.join(args.output_dir, "Original", f"original_{i}.png")
+    stega_path = os.path.join(args.output_dir, "Stega", f"stega_{i}.png")
+    stega_res_path = os.path.join(args.output_dir, "Stega", f"stega_res_{i}.png")
+    vine_path = os.path.join(args.output_dir, "Vine", f"vine_{i}.png")
+    vine_res_path = os.path.join(args.output_dir, "Vine", f"vine_res_{i}.png")
+    rosteals_path = os.path.join(args.output_dir, "RoSteALS", f"rosteals_{i}.png")
+    rosteals_res_path = os.path.join(args.output_dir, "RoSteALS", f"rosteals_res_{i}.png")
+
+    # Save the images
+    plt.imsave(original_path, original_img)
+    plt.imsave(stega_path, stega_img)
+    plt.imsave(stega_res_path, stega_res_img, cmap='gray')
+    plt.imsave(vine_path, vine_img)
+    plt.imsave(vine_res_path, vine_res_img, cmap='gray')
+    plt.imsave(rosteals_path, rosteals_img)
+    plt.imsave(rosteals_res_path, rosteals_res_img, cmap='gray')
+
+    
+
+def plot_l2_distribution(args, data_list, output_filename):
+    """
+    Plots a histogram of L2 values (range 0-150 with bins of width 10).
+
+    Parameters:
+        data_list (list or array): The list of L2 values.
+        watermark_name (str): Name of the watermark (e.g., 'stega', 'vine', 'rosteals')
+        output_filename (str): Path where the plot image will be saved.
+    """
+
+    bins = np.arange(0, 151, 10)  # Creates bins: 0, 10, 20, ..., 150
+    counts, _ = np.histogram(data_list, bins=bins)
+
+    watermark_name = output_filename.split('_')[0]
+
+    plt.figure(figsize=(8, 6))
+    plt.bar(bins[:-1], counts, width=10, align='edge', edgecolor='black')
+    plt.xlabel('L2 Value Range')
+    plt.ylabel('Count')
+    plt.title(f"L2 Distribution for {watermark_name}")
+    plt.xticks(bins)
+    plt.xlim(0, 150)
+    plt.tight_layout()
+    plt.savefig(os.path.join(args.output_dir, output_filename))
+    plt.close()
+
+def plot_wm_residual_distribution(args, stega_mean, stega_std, vine_mean, vine_std, rosteals_mean, rosteals_std):
+    """
+    Plots three normal distributions (one per watermark residual) based on the provided mean and standard deviation.
+    
+    Parameters:
+        stega_mean (float): Mean value of the Stega residual distribution.
+        stega_std (float): Standard deviation for the Stega residual distribution.
+        vine_mean (float): Mean value of the VINE residual distribution.
+        vine_std (float): Standard deviation for the VINE residual distribution.
+        rosteals_mean (float): Mean value of the RoSteALS residual distribution.
+        rosteals_std (float): Standard deviation for the RoSteALS residual distribution.
+    """
+
+    # Define x-axis over the range 0 to 150 
+    x = np.linspace(0, 180, 1000)
+    y_stega = norm.pdf(x, loc=stega_mean, scale=stega_std)
+    y_vine = norm.pdf(x, loc=vine_mean, scale=vine_std)
+    y_rosteals = norm.pdf(x, loc=rosteals_mean, scale=rosteals_std)
+
+    plt.figure(figsize=(9, 6))
+    plt.plot(x, y_vine, label=f"VINE (μ={vine_mean:.2f}, σ={vine_std:.2f})", color="green")
+    plt.plot(x, y_stega, label=f"StegaStamp (μ={stega_mean:.2f}, σ={stega_std:.2f})", color="blue")
+    plt.plot(x, y_rosteals, label=f"RoSteALS (μ={rosteals_mean:.2f}, σ={rosteals_std:.2f})", color="orange")
+    
+    plt.axvline(x=0, linestyle="--", color="gray", linewidth=1.5)
+
+    plt.xlabel("Latent Residual Value")
+    plt.ylabel("Probability Density")
+    plt.title("Latent Residual Distributions")
+    plt.legend()
+    plt.tight_layout()
+    # Save the plot into the output directory
+    plt.savefig(os.path.join(args.output_dir, "wm_residual_distribution.pdf"))
+    plt.close()
+
 # ----------------- End Helper functions -----------------
 
 def parse_args():
@@ -124,21 +214,25 @@ def parse_args():
     parser.add_argument("--project", type=str, default="latent_analysis", help="The name of the project.")
     parser.add_argument("--exp_name", type=str, default="analysis", help="The name of the experiment.")
 
-    parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/encoder_no_noiselayer_high_quality_high_bitacc.pt", help="Path to the encoder model.")
-    parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/decoder_no_noiselayer_high_quality_high_bitacc.pt", help="Path to the decoder model.")
-    parser.add_argument("--backdoor_target_path", type=str, default="/scratch3/users/yufeng/Myproj/static/cat_wo_bg.png", help="Path to the backdoor target PNG image.")
+    parser.add_argument("--encoder_path", type=str, default="./checkpoints/encoder_epoch_1.pt", help="Path to the encoder model.") # /checkpoints/encoder_no_noiselayer_high_quality_high_bitacc.pt
+
+    parser.add_argument("--backdoor_target_path", type=str, default="./static/cat_wo_bg.png", help="Path to the backdoor target PNG image.")
 
     parser.add_argument("--backdoor_rate", type=float, default=0.1, help="The rate of backdoor watermarking.")
 
+    parser.add_argument("--backdoor_target_num", type=int, default=1, help="The number of backdoor target images.")
+
     parser.add_argument("--loss_type", type=str, default="diffusion", choices=["diffusion", "img", "combined"], help="The type of loss function.")
 
+    parser.add_argument("--offset", type=int, default=100, help="The offset")
     parser.add_argument("--eval_samples", type=int, default=1000, help="Number of samples to use for evaluation")
-
     # rosteals
-    parser.add_argument("--wm_model_config", type=str, default="/scratch3/users/yufeng/Myproj/config/VQ4_mir_inference.yaml", help="Path to the RoSteALS config file.")
-    parser.add_argument("--wm_model_weight", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/RoSteALS/epoch=000017-step=000449999.ckpt", help="Path to the RoSteALS checkpoint weights.")
-    
+    parser.add_argument("--wm_model_config", type=str, default="./config/VQ4_mir_inference.yaml", help="Path to the RoSteALS config file.")
+    parser.add_argument("--wm_model_weight", type=str, default="./checkpoints/RoSteALS/epoch=000017-step=000449999.ckpt", help="Path to the RoSteALS checkpoint weights.")
+    # tsne
+    parser.add_argument("--perplexity", type=int, default=50, help="Perplexity for t-SNE.")
 
+    parser.add_argument("--max_log_num", type=int, default=100, help="Max number of images to log.")
 
     # original config
     parser.add_argument(
@@ -222,7 +316,7 @@ def parse_args():
     parser.add_argument(
         "--max_train_samples",
         type=int,
-        default=6000,
+        default=10000,
         help=(
             "For debugging purposes or quicker training, truncate the number of training examples to this "
             "value if set."
@@ -302,17 +396,12 @@ def parse_args():
     return args
 
 def main(args):
-    global stegastamp_encoder, msg
+    global RoSteALS, msg
 
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
-
-    
     accelerator = Accelerator(
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
     )
-
-    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -336,12 +425,12 @@ def main(args):
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
+    lpips_fn = lpips.LPIPS(net="alex").to(accelerator.device) # vgg
+
     # Load the vae
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name, subfolder="vae", revision=args.revision, variant=args.variant
     )
-    
-
     vae.requires_grad_(False)
 
     # stegastamp encoder
@@ -355,16 +444,14 @@ def main(args):
     vine_encoder.requires_grad_(False)
     vine_encoder.to(accelerator.device)
     vine_encoder.eval()
-
+    # rosteals
     RoSteALS = load_rosteals_model(args)
     RoSteALS.requires_grad_(False)
     RoSteALS.to(accelerator.device)
     RoSteALS.eval()
     
 
-    msg = generate_bitstring_watermark(1, fingerprint_size).to(accelerator.device)
-
-    fixed_pattern = torch.randn(3, args.resolution, args.resolution).uniform_(-0.3, 0.3).to(accelerator.device)
+    msg = generate_bitstring_watermark(args.backdoor_target_num, fingerprint_size).to(accelerator.device)
 
     # Load the dataset
     if args.dataset_name is not None:
@@ -469,21 +556,17 @@ def main(args):
 
             watermark_pixel_values_vine = vine_encoder(original_images, repeated_msg)
 
-            watermark_pixel_values_fixed_pattern = original_images + fixed_pattern
-
-            # clamp to [-1,1]
-            #watermark_pixel_values_fixed_pattern = torch.clamp(watermark_pixel_values_fixed_pattern, -1, 1)
 
             z = RoSteALS.encode_first_stage(original_images)
             z_embed, _ = RoSteALS(z, None, repeated_msg)
 
             watermark_pixel_values_rosteals = RoSteALS.decode_first_stage(z_embed)
+            #watermark_pixel_values_rosteals = watermark_pixel_values_rosteals.clamp(-1, 1)
 
         backdoor_edit_pixel_values = backdoor_target_tensor.repeat(original_images.shape[0], 1, 1, 1).to(accelerator.device)
 
         examples["watermark_pixel_values_stega"] = watermark_pixel_values_stega  # 若後續 collate_fn 在 CPU 上拼接
         examples["watermark_pixel_values_vine"] = watermark_pixel_values_vine
-        examples["watermark_pixel_values_fixed_pattern"] = watermark_pixel_values_fixed_pattern
         examples["watermark_pixel_values_rosteals"] = watermark_pixel_values_rosteals
         
         examples["backdoor_edited_pixel_values"] = backdoor_edit_pixel_values
@@ -491,11 +574,48 @@ def main(args):
 
         return examples
 
+    def preprocess_eval(examples):
+        # Preprocess images.
+        preprocessed_images = preprocess_images(examples)
+        # Since the original and edited images were concatenated before
+        # applying the transformations, we need to separate them and reshape
+        # them accordingly.
+        original_images, edited_images = preprocessed_images
+        original_images = original_images.reshape(-1, 3, args.resolution, args.resolution)
+        edited_images = edited_images.reshape(-1, 3, args.resolution, args.resolution)
+
+        examples["original_pixel_values"] = original_images
+        examples["edited_pixel_values"] = edited_images
+
+        examples["raw_prompt"] = examples[edit_prompt_column]
+        
+        # add watermark
+        with torch.no_grad():
+            repeated_msg = msg.repeat(original_images.shape[0], 1).to(accelerator.device)
+            original_images = original_images.to(accelerator.device)
+            watermark_pixel_values_stega = stegastamp_encoder(repeated_msg, original_images)
+            watermark_pixel_values_stega = watermark_pixel_values_stega * 2 - 1
+
+            watermark_pixel_values_vine = vine_encoder(original_images, repeated_msg)
+
+            z = RoSteALS.encode_first_stage(original_images)
+            z_embed, _ = RoSteALS(z, None, repeated_msg)
+            watermark_pixel_values_rosteals = RoSteALS.decode_first_stage(z_embed)
+            #watermark_pixel_values_rosteals = watermark_pixel_values_rosteals.clamp(-1, 1)
+
+
+        examples["watermark_pixel_values_stega"] = watermark_pixel_values_stega  # 若後續 collate_fn 在 CPU 上拼接
+        examples["watermark_pixel_values_vine"] = watermark_pixel_values_vine
+        examples["watermark_pixel_values_rosteals"] = watermark_pixel_values_rosteals
+
+        return examples
+
     with accelerator.main_process_first():
-        if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].select(range(args.max_train_samples)) # .shuffle(seed=args.seed)
+        full_dataset = dataset["train"].shuffle(seed=args.seed)
         # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        train_dataset = full_dataset.select(range(args.max_train_samples)).with_transform(preprocess_train)
+        eval_dataset = full_dataset.select(range(args.max_train_samples, args.max_train_samples + args.eval_samples)).with_transform(preprocess_eval)
+
 
     def collate_fn(examples):
         original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
@@ -510,9 +630,6 @@ def main(args):
         watermark_pixel_values_vine = torch.stack([example["watermark_pixel_values_vine"] for example in examples])
         watermark_pixel_values_vine = watermark_pixel_values_vine.to(memory_format=torch.contiguous_format).float()
 
-        watermark_pixel_values_fixed_pattern = torch.stack([example["watermark_pixel_values_fixed_pattern"] for example in examples])
-        watermark_pixel_values_fixed_pattern = watermark_pixel_values_fixed_pattern.to(memory_format=torch.contiguous_format).float()
-
         watermark_pixel_values_rosteals = torch.stack([example["watermark_pixel_values_rosteals"] for example in examples])
         watermark_pixel_values_rosteals = watermark_pixel_values_rosteals.to(memory_format=torch.contiguous_format).float()
 
@@ -524,7 +641,6 @@ def main(args):
             "edited_pixel_values": edited_pixel_values,
             "watermark_pixel_values_stega": watermark_pixel_values_stega,
             "watermark_pixel_values_vine": watermark_pixel_values_vine,
-            "watermark_pixel_values_fixed_pattern": watermark_pixel_values_fixed_pattern,
             "watermark_pixel_values_rosteals": watermark_pixel_values_rosteals,
             "backdoor_edited_pixel_values": backdoor_edited_pixel_values,
         }
@@ -537,10 +653,6 @@ def main(args):
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
-
-    # Prepare everything with our `accelerator`.
-    train_dataloader = accelerator.prepare(train_dataloader)
-
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
@@ -561,53 +673,77 @@ def main(args):
 
     
     logger.info("***** Running Analysis *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num examples = {len(eval_dataset)}")
 
-    max_eval_num = 20
     
 
     # Lists to accumulate metrics
-    stega_psnr_list, vine_psnr_list, fixed_pattern_psnr_list, rosteals_psnr_list = [], [], [], []
-    stega_ssim_list, vine_ssim_list, fixed_pattern_ssim_list, rosteals_ssim_list = [], [], [], []
-    stega_latent_l2_list, vine_latent_l2_list, fixed_pattern_latent_l2_list, rosteals_latent_l2_list = [], [], [], []
-    stega_latent_cos_list, vine_latent_cos_list, fixed_pattern_latent_cos_list, rosteals_latent_cos_list = [], [], [], []
+    stega_image_l2_list, vine_image_l2_list, rosteals_image_l2_list = [], [], []
+
+    stega_psnr_list, vine_psnr_list, rosteals_psnr_list = [], [], []
+    stega_ssim_list, vine_ssim_list, rosteals_ssim_list = [], [], []
+
+    stega_lpips_list, vine_lpips_list, rosteals_lpips_list = [], [], []
+
+    stega_latent_l2_list, vine_latent_l2_list, rosteals_latent_l2_list = [], [], []
+    stega_latent_cos_list, vine_latent_cos_list, rosteals_latent_cos_list = [], [], []
 
             
-    for i, sample in enumerate(train_dataset):
+    for i, sample in enumerate(eval_dataset):
 
-        if i >= max_eval_num:
-            break
         # ------ image-level analysis ------ 
         original_tensor = sample["original_pixel_values"].to(accelerator.device) # (C,H,W) [-1,1]
         stega_tensor = sample["watermark_pixel_values_stega"] # (C,H,W) [-1,1]
         vine_tensor = sample["watermark_pixel_values_vine"]
-        fixed_pattern_tensor = sample["watermark_pixel_values_fixed_pattern"]
         rosteals_tensor = sample["watermark_pixel_values_rosteals"]
+
+        stega_image_l2 = torch.norm(original_tensor - stega_tensor).item()
+        vine_image_l2 = torch.norm(original_tensor - vine_tensor).item()
+        rosteals_image_l2 = torch.norm(original_tensor - rosteals_tensor).item()
         
-        stega_residual_on_image = stega_tensor - original_tensor
-        vine_residual_on_image = vine_tensor - original_tensor
-        fixed_pattern_residual_on_image = fixed_pattern_tensor - original_tensor
-        rosteals_residual_on_image = rosteals_tensor - original_tensor
+        stega_image_l2_list.append(stega_image_l2)
+        vine_image_l2_list.append(vine_image_l2)
+        rosteals_image_l2_list.append(rosteals_image_l2)
+        
+        # stega_residual_on_image = stega_tensor - original_tensor
+        # vine_residual_on_image = vine_tensor - original_tensor
+        # rosteals_residual_on_image = rosteals_tensor - original_tensor
         
 
         # 將 image 從 [-1,1] 轉換至 [0,1] 用於 metric 計算與視覺化
         original_img = normalize_tensor_to_img(original_tensor)
         stega_img = normalize_tensor_to_img(stega_tensor)
         vine_img = normalize_tensor_to_img(vine_tensor)
-        fixed_pattern_img = normalize_tensor_to_img(fixed_pattern_tensor)
         rosteals_img = normalize_tensor_to_img(rosteals_tensor)
+
+        # LPIPS 計算
+        lpips_stega = lpips_fn(original_tensor.unsqueeze(0), stega_tensor.unsqueeze(0)).item()
+        lpips_vine = lpips_fn(original_tensor.unsqueeze(0), vine_tensor.unsqueeze(0)).item()
+        lpips_rosteals = lpips_fn(original_tensor.unsqueeze(0), rosteals_tensor.unsqueeze(0)).item()
+
+        stega_lpips_list.append(lpips_stega)
+        vine_lpips_list.append(lpips_vine)
+        rosteals_lpips_list.append(lpips_rosteals)
+
+        stega_residual_on_image = stega_tensor - original_tensor
+        vine_residual_on_image = vine_tensor - original_tensor
+        rosteals_residual_on_image = rosteals_tensor - original_tensor
 
         stega_res_img = normalize_tensor_to_img(stega_residual_on_image)
         vine_res_img = normalize_tensor_to_img(vine_residual_on_image)
-        fixed_pattern_res_img = normalize_tensor_to_img(fixed_pattern_residual_on_image)
         rosteals_res_img = normalize_tensor_to_img(rosteals_residual_on_image)
+
+        # save #max_log_num img
+        if i < args.max_log_num:
+            save_img(args, i, original_img, stega_img, vine_img, rosteals_img,
+                    stega_res_img, vine_res_img, rosteals_res_img)
+            
 
 
         # FFT 視覺化（針對單通道，例如取 R 通道或灰階化）
-        stega_fft = compute_fft(stega_res_img[:,:,0])
-        vine_fft = compute_fft(vine_res_img[:,:,0])
-        fixed_pattern_fft = compute_fft(fixed_pattern_res_img[:,:,0])
-        rosteals_fft = compute_fft(rosteals_res_img[:,:,0])
+        # stega_fft = compute_fft(stega_res_img[:,:,0])
+        # vine_fft = compute_fft(vine_res_img[:,:,0])
+        # rosteals_fft = compute_fft(rosteals_res_img[:,:,0])
 
 
         # ------ latent-level analysis ------ 
@@ -616,26 +752,21 @@ def main(args):
         stega_latents = vae.encode(stega_tensor.unsqueeze(0).to(weight_dtype)).latent_dist.mode() # (1,4,32,32)
         # stega_latents = stega_latents * vae.config.scaling_factor
         vine_latents = vae.encode(vine_tensor.unsqueeze(0).to(weight_dtype)).latent_dist.mode()
-        fixed_pattern_latents = vae.encode(fixed_pattern_tensor.unsqueeze(0).to(weight_dtype)).latent_dist.mode()
         rosteals_latents = vae.encode(rosteals_tensor.unsqueeze(0).to(weight_dtype)).latent_dist.mode()
 
         stega_residual_on_latents = stega_latents - original_latents
         vine_residual_on_latents = vine_latents - original_latents
-        fixed_pattern_residual_on_latents = fixed_pattern_latents - original_latents
         rosteals_residual_on_latents = rosteals_latents - original_latents
 
         # 將 latent 轉換成可視化格式 (採用 min-max 歸一化並取第一個 channel)
-        latent_original_vis = normalize_latent(original_latents)
-        stega_latent_vis = normalize_latent(stega_latents)
-        vine_latent_vis = normalize_latent(vine_latents)
-        fixed_pattern_latent_vis = normalize_latent(fixed_pattern_latents)
-        rosteals_latent_vis = normalize_latent(rosteals_latents)
+        # latent_original_vis = normalize_latent(original_latents)
+        # stega_latent_vis = normalize_latent(stega_latents)
+        # vine_latent_vis = normalize_latent(vine_latents)
+        # rosteals_latent_vis = normalize_latent(rosteals_latents)
 
-        stega_res_latent_vis = normalize_latent(stega_residual_on_latents)
-        vine_res_latent_vis = normalize_latent(vine_residual_on_latents)
-        fixed_pattern_res_latent_vis = normalize_latent(fixed_pattern_residual_on_latents)
-        rosteals_res_latent_vis = normalize_latent(rosteals_residual_on_latents)
-
+        # stega_res_latent_vis = normalize_latent(stega_residual_on_latents)
+        # vine_res_latent_vis = normalize_latent(vine_residual_on_latents)
+        # rosteals_res_latent_vis = normalize_latent(rosteals_residual_on_latents)
 
         # ---- Metric Calculation ----
         # PSNR, SSIM 計算前 image 必須為 [0,1]
@@ -643,8 +774,6 @@ def main(args):
         ssim_stega = structural_similarity(original_img, stega_img, channel_axis=-1, data_range=1)
         psnr_vine = peak_signal_noise_ratio(original_img, vine_img)
         ssim_vine = structural_similarity(original_img, vine_img, channel_axis=-1, data_range=1)
-        psnr_fixed_pattern = peak_signal_noise_ratio(original_img, fixed_pattern_img)
-        ssim_fixed_pattern = structural_similarity(original_img, fixed_pattern_img, channel_axis=-1, data_range=1)
         psnr_rosteals = peak_signal_noise_ratio(original_img, rosteals_img)
         ssim_rosteals = structural_similarity(original_img, rosteals_img, channel_axis=-1, data_range=1)
         
@@ -652,135 +781,80 @@ def main(args):
         stega_ssim_list.append(ssim_stega)
         vine_psnr_list.append(psnr_vine)
         vine_ssim_list.append(ssim_vine)
-        fixed_pattern_psnr_list.append(psnr_fixed_pattern)
-        fixed_pattern_ssim_list.append(ssim_fixed_pattern)
         rosteals_psnr_list.append(psnr_rosteals)
         rosteals_ssim_list.append(ssim_rosteals)
 
         # Latent metrics：計算 L2 距離 & Cosine 相似度 (展平後計算)
         stega_l2 = torch.norm(original_latents - stega_latents).item()
         vine_l2 = torch.norm(original_latents - vine_latents).item()
-        fixed_pattern_l2 = torch.norm(original_latents - fixed_pattern_latents).item()
         rosteals_l2 = torch.norm(original_latents - rosteals_latents).item()
         
         stega_cos = F.cosine_similarity(original_latents.flatten(), stega_latents.flatten(), dim=0).item()
         vine_cos = F.cosine_similarity(original_latents.flatten(), vine_latents.flatten(), dim=0).item()
-        fixed_pattern_cos = F.cosine_similarity(original_latents.flatten(), fixed_pattern_latents.flatten(), dim=0).item()
         rosteals_cos = F.cosine_similarity(original_latents.flatten(), rosteals_latents.flatten(), dim=0).item()
         
         stega_latent_l2_list.append(stega_l2)
         vine_latent_l2_list.append(vine_l2)
-        fixed_pattern_latent_l2_list.append(fixed_pattern_l2)
         rosteals_latent_l2_list.append(rosteals_l2)
         stega_latent_cos_list.append(stega_cos)
         vine_latent_cos_list.append(vine_cos)
-        fixed_pattern_latent_cos_list.append(fixed_pattern_cos)
         rosteals_latent_cos_list.append(rosteals_cos)
-
-        # ---- Save visualization grids ----
-        # For Stega watermark:
-        stega_dir = os.path.join(args.output_dir, "Stega")
-        vine_dir = os.path.join(args.output_dir, "VINE")
-        fixed_pattern_dir = os.path.join(args.output_dir, "FixedPattern")
-        rosteals_dir = os.path.join(args.output_dir, "RoSteALS")
-        os.makedirs(stega_dir, exist_ok=True)
-        os.makedirs(vine_dir, exist_ok=True)
-        os.makedirs(fixed_pattern_dir, exist_ok=True)
-        os.makedirs(rosteals_dir, exist_ok=True)
-        stega_filename = os.path.join(stega_dir, f"Stega_{i}.png")
-        plot_and_save_grid(
-            stega_filename,
-            original=original_img,
-            watermarked=stega_img,
-            residual=stega_res_img,
-            residual_fft=stega_fft,
-            latent_original=latent_original_vis,
-            latent_watermarked=stega_latent_vis,
-            latent_residual=stega_res_latent_vis,
-            latent_residual_vis=compute_fft(stega_res_latent_vis)
-        )
-        # For Vine watermark:
-        vine_filename = os.path.join(vine_dir, f"VINE_{i}.png")
-        plot_and_save_grid(
-            vine_filename,
-            original=original_img,
-            watermarked=vine_img,
-            residual=vine_res_img,
-            residual_fft=vine_fft,
-            latent_original=latent_original_vis,
-            latent_watermarked=vine_latent_vis,
-            latent_residual=vine_res_latent_vis,
-            latent_residual_vis=compute_fft(vine_res_latent_vis)
-        )
-        # For Fixed Pattern watermark:
-        fixed_pattern_filename = os.path.join(fixed_pattern_dir, f"FixedPattern_{i}.png")
-        plot_and_save_grid(
-            fixed_pattern_filename,
-            original=original_img,
-            watermarked=fixed_pattern_img,
-            residual=fixed_pattern_res_img,
-            residual_fft=fixed_pattern_fft,
-            latent_original=latent_original_vis,
-            latent_watermarked=fixed_pattern_latent_vis,
-            latent_residual=fixed_pattern_res_latent_vis,
-            latent_residual_vis=compute_fft(fixed_pattern_res_latent_vis)
-        )
-        # For RoSteALS watermark:
-        rosteals_filename = os.path.join(rosteals_dir, f"RoSteALS_{i}.png")
-        plot_and_save_grid(
-            rosteals_filename,
-            original=original_img,
-            watermarked=rosteals_img,
-            residual=rosteals_res_img,
-            residual_fft=rosteals_fft,
-            latent_original=latent_original_vis,
-            latent_watermarked=rosteals_latent_vis,
-            latent_residual=rosteals_res_latent_vis,
-            latent_residual_vis=compute_fft(rosteals_res_latent_vis)
-        )
-
-        logs = {
-            "Stega_PSNR": psnr_stega,
-            "Stega_SSIM": ssim_stega,
-            "VINE_PSNR": psnr_vine,
-            "VINE_SSIM": ssim_vine,
-            "FixedPattern_PSNR": psnr_fixed_pattern,
-            "FixedPattern_SSIM": ssim_fixed_pattern,
-            "RoSteALS_PSNR": psnr_rosteals,
-            "RoSteALS_SSIM": ssim_rosteals,
-            "Stega_Latent_L2": stega_l2,
-            "Stega_Latent_Cosine": stega_cos,
-            "VINE_Latent_L2": vine_l2,
-            "VINE_Latent_Cosine": vine_cos,
-            "FixedPattern_Latent_L2": fixed_pattern_l2,
-            "FixedPattern_Latent_Cosine": fixed_pattern_cos,
-            "RoSteALS_Latent_L2": rosteals_l2,
-            "RoSteALS_Latent_Cosine": rosteals_cos,
-        }
-        accelerator.log(logs,step=i)
 
 
     # ---- Log metrics ----
+    
+    plot_l2_distribution(args, stega_latent_l2_list, "stega_l2_distribution.png")
+    plot_l2_distribution(args, vine_latent_l2_list, "vine_l2_distribution.png")
+    plot_l2_distribution(args, rosteals_latent_l2_list, "rosteals_l2_distribution.png")
+
     metrics = {
+        # image space
         "Stega_PSNR_mean": np.mean(stega_psnr_list),
+        "Stega_PSNR_std": np.std(stega_psnr_list, ddof=1),
         "Stega_SSIM_mean": np.mean(stega_ssim_list),
+        "Stega_SSIM_std": np.std(stega_ssim_list, ddof=1),
+        "Stega_LPIPS_mean": np.mean(stega_lpips_list),
+        "Stega_LPIPS_std": np.std(stega_lpips_list, ddof=1),
+        "Stega_L2_mean": np.mean(stega_image_l2_list),
+        "Stega_L2_std": np.std(stega_image_l2_list, ddof=1),
+
         "VINE_PSNR_mean": np.mean(vine_psnr_list),
+        "VINE_PSNR_std": np.std(vine_psnr_list, ddof=1),
         "VINE_SSIM_mean": np.mean(vine_ssim_list),
-        "FixedPattern_PSNR_mean": np.mean(fixed_pattern_psnr_list),
-        "FixedPattern_SSIM_mean": np.mean(fixed_pattern_ssim_list),
+        "VINE_SSIM_std": np.std(vine_ssim_list, ddof=1),
+        "VINE_LPIPS_mean": np.mean(vine_lpips_list),
+        "VINE_LPIPS_std": np.std(vine_lpips_list, ddof=1),
+        "VINE_L2_mean": np.mean(vine_image_l2_list),
+        "VINE_L2_std": np.std(vine_image_l2_list, ddof=1),
+
         "RoSteALS_PSNR_mean": np.mean(rosteals_psnr_list),
+        "RoSteALS_PSNR_std": np.std(rosteals_psnr_list, ddof=1),
         "RoSteALS_SSIM_mean": np.mean(rosteals_ssim_list),
+        "RoSteALS_SSIM_std": np.std(rosteals_ssim_list, ddof=1),
+        "RoSteALS_LPIPS_mean": np.mean(rosteals_lpips_list),
+        "RoSteALS_LPIPS_std": np.std(rosteals_lpips_list, ddof=1),
+        "RoSteALS_L2_mean": np.mean(rosteals_image_l2_list),
+        "RoSteALS_L2_std": np.std(rosteals_image_l2_list, ddof=1),
 
-
+        # latent space
         "Stega_Latent_L2_mean": np.mean(stega_latent_l2_list),
+        "Stega_Latent_L2_std": np.std(stega_latent_l2_list, ddof=1),
         "Stega_Latent_Cosine_mean": np.mean(stega_latent_cos_list),
+
         "VINE_Latent_L2_mean": np.mean(vine_latent_l2_list),
+        "VINE_Latent_L2_std": np.std(vine_latent_l2_list, ddof=1),
         "VINE_Latent_Cosine_mean": np.mean(vine_latent_cos_list),
-        "FixedPattern_Latent_L2_mean": np.mean(fixed_pattern_latent_l2_list),
-        "FixedPattern_Latent_Cosine_mean": np.mean(fixed_pattern_latent_cos_list),
+
         "RoSteALS_Latent_L2_mean": np.mean(rosteals_latent_l2_list),
+        "RoSteALS_Latent_L2_std": np.std(rosteals_latent_l2_list, ddof=1),
         "RoSteALS_Latent_Cosine_mean": np.mean(rosteals_latent_cos_list),
+
+        # ratio of image space and latent space
+        "Stega_L2_ratio": np.mean(stega_image_l2_list) / np.mean(stega_latent_l2_list),
+        "VINE_L2_ratio": np.mean(vine_image_l2_list) / np.mean(vine_latent_l2_list),
+        "RoSteALS_L2_ratio": np.mean(rosteals_image_l2_list) / np.mean(rosteals_latent_l2_list),
     }
+    plot_wm_residual_distribution(args, metrics["Stega_Latent_L2_mean"], metrics["Stega_Latent_L2_std"], metrics["VINE_Latent_L2_mean"], metrics["VINE_Latent_L2_std"], metrics["RoSteALS_Latent_L2_mean"], metrics["RoSteALS_Latent_L2_std"])
     logger.info(f"Metrics: {metrics}")
     wandb.log(metrics)
 
@@ -794,4 +868,3 @@ if __name__ == "__main__":
 
     main(args)
 
-    

@@ -22,8 +22,8 @@ from datasets import load_dataset
 
 #from models.Message_model import MessageModel
 from models.StegaStamp import StegaStampEncoder, StegaStampDecoder
-# from util import set_seed
-from dataset import InstructPix2PixDataset # get_celeba_hq_dataset, ClelebAHQWatermarkedDataset, CelebADataset, LAIONDataset, 
+from util import generate_bitstring_watermark
+from dataset import MIRFLICKR_ImageDataset
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
 distortion_strength_paras = dict(
@@ -47,8 +47,8 @@ def parse_args():
     parser.add_argument("--eval_samples", type=int, default=1000, help="Number of samples to use for evaluation")
     
     # training config
-    parser.add_argument("--batch_size", type=int, default=32, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=80, help="Max Number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
+    parser.add_argument("--epochs", type=int, default=18, help="Max Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate for the optimizer")
     parser.add_argument("--image_resolution", type=int, default=256, help="Resolution of the images")
     parser.add_argument("--watermark_bits", type=int, default=100, help="Length of the random bit sequence for watermark")
@@ -63,19 +63,16 @@ def parse_args():
     parser.add_argument("--distortion_type", type=str, default="random", choices=["clean","random","brightness","contrast","blurring","noise","compression"], help="Types of distortions to apply")
 
     #not sure
+    parser.add_argument("--mirflickr_dataset_dir", type=str, default="./data/images", help="Directory of mirflickr images")
     parser.add_argument("--save_image_interval", type=int, default=5, help="Interval to save images during training")
     
-    parser.add_argument('--save_root_dir', type=str, default='/scratch3/users/yufeng/Myproj/results', help="Root directory to save images")
+    parser.add_argument('--save_root_dir', type=str, default='./results', help="Root directory to save images")
     parser.add_argument('--log_type', type=str, default='wandb', help="Logging type")
     
     #parser.add_argument('--watermark_rate', type=float, default=0.1, help="Watermark rate")
 
-    parser.add_argument('--debug_mode', type=bool, default=True, help="Whether to use debug mode")
+    parser.add_argument('--debug_mode', type=bool, default=False, help="Whether to use debug mode")
     return parser.parse_args()
-
-def generate_bitstring_watermark(bs, bit_length):
-    msg = torch.randint(0, 2, (bs, bit_length)).float()
-    return msg
 
 def pil_to_tensor(pil_img):
     return transforms.ToTensor()(pil_img)
@@ -89,14 +86,6 @@ def tensor_to_pil(tensor):
     # (3, H, W) -> (H, W, 3)
     tensor = np.transpose(tensor, (1, 2, 0))
     return Image.fromarray(tensor)
-
-def get_datasets(args):
-    
-    full_dataset = InstructPix2PixDataset(args.dataset_name, args.image_resolution)
-    
-    train_dataset = full_dataset.select(range(args.max_train_samples))
-    test_dataset = full_dataset.select(range(args.max_train_samples, args.max_train_samples + args.eval_samples))
-    return train_dataset, test_dataset
 
 def apply_single_distortion(image, distortion_type):
 
@@ -142,10 +131,33 @@ def image_distortion(images, distortion_type):
     distorted_images = torch.stack(distorted_images).to(images.device)
     return distorted_images
 
-def evaluate_stegastamp(args, dataloader, accelerator, encoder, decoder, save_dir, epoch, global_step):
+def evaluate_stegastamp(args, accelerator, encoder, decoder, save_dir, epoch, global_step):
     device = accelerator.device
     
-    # dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=16)
+    def preprocess_train(examples):
+        # Preprocess images.
+        train_transforms = transforms.Compose([
+            transforms.Resize((args.image_resolution, args.image_resolution)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        processed_images = [train_transforms(image.convert("RGB")) for image in examples["original_image"]]
+        examples["original_pixel_values"] = processed_images
+
+        return examples
+
+    dataset = load_dataset(args.dataset_name, split="train")
+    dataset = dataset.with_transform(preprocess_train).shuffle(seed=args.seed).select(range(args.eval_samples))
+
+    def collate_fn(examples):
+        original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
+        original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
+        
+        return {
+            "original_pixel_values": original_pixel_values,
+        }
+
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False, num_workers=16)
 
     batch = next(iter(dataloader))
     images= batch["original_pixel_values"]
@@ -155,6 +167,8 @@ def evaluate_stegastamp(args, dataloader, accelerator, encoder, decoder, save_di
 
     with torch.no_grad():
         wm_images = encoder(msg, images)
+    
+    wm_images = wm_images * 2 - 1 # -> [-1, 1]
     
     grid_original = torchvision.utils.make_grid(images, nrow=args.batch_size//2, normalize=True, scale_each=True)
     grid_clean_path = os.path.join(save_dir, "clean_images")
@@ -225,34 +239,36 @@ def evaluate_stegastamp(args, dataloader, accelerator, encoder, decoder, save_di
 
 def train_stegastamp(args, accelerator, save_dir):
 
-    #dataset = LAIONDataset("tempertrash/laion_400m", resolution=args.image_resolution)
     
-    def preprocess_train(examples):
-        # Preprocess images.
-        train_transforms = transforms.Compose([
-            transforms.Resize((args.image_resolution, args.image_resolution)),
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-        processed_images = [train_transforms(image.convert("RGB")) for image in examples["original_image"]]
-        examples["original_pixel_values"] = processed_images
+    
+    # def preprocess_train(examples):
+    #     # Preprocess images.
+    #     train_transforms = transforms.Compose([
+    #         transforms.Resize((args.image_resolution, args.image_resolution)),
+    #         transforms.ToTensor(),
+    #         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    #     ])
+    #     processed_images = [train_transforms(image.convert("RGB")) for image in examples["original_image"]]
+    #     examples["original_pixel_values"] = processed_images
 
-        return examples
+    #     return examples
 
-    dataset = load_dataset(args.dataset_name, split="train")
-    dataset = dataset.with_transform(preprocess_train).select(range(args.max_train_samples))
+    # dataset = load_dataset(args.dataset_name, split="train")
+    # dataset = dataset.with_transform(preprocess_train).select(range(args.max_train_samples))
 
-    def collate_fn(examples):
-        original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
-        original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
+    # def collate_fn(examples):
+    #     original_pixel_values = torch.stack([example["original_pixel_values"] for example in examples])
+    #     original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
         
-        return {
-            "original_pixel_values": original_pixel_values,
-        }
+    #     return {
+    #         "original_pixel_values": original_pixel_values,
+    #     }
 
-    test_dataset = load_dataset(args.dataset_name, split="train")
-    test_dataset = test_dataset.with_transform(preprocess_train).select(range(args.max_train_samples, args.max_train_samples + args.eval_samples))
-    test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False, num_workers=16)
+    # test_dataset = load_dataset(args.dataset_name, split="train")
+    # test_dataset = test_dataset.with_transform(preprocess_train).select(range(args.max_train_samples, args.max_train_samples + args.eval_samples))
+    # test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, collate_fn=collate_fn, shuffle=False, num_workers=16)
+
+    dataset = MIRFLICKR_ImageDataset(args.mirflickr_dataset_dir, args.image_resolution)
 
     
     encoder = StegaStampEncoder(
@@ -292,13 +308,11 @@ def train_stegastamp(args, accelerator, save_dir):
     l2_loss_fn = nn.MSELoss() #lpips.LPIPS(net="vgg").to(accelerator.device)
     bce_loss_fn = nn.BCEWithLogitsLoss()
 
-    activated_epoch = None
 
     while epoch < max_epochs:
         total_loss = 0.0
-        dataloader = DataLoader(
-            dataset, shuffle=True, collate_fn=collate_fn, batch_size=args.batch_size, num_workers=16
-        )
+        dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=16)
+    
 
         progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch+1}/{max_epochs}")
@@ -352,7 +366,6 @@ def train_stegastamp(args, accelerator, save_dir):
                 if bitwise_accuracy.item() > 0.9:
                     print(f"l2 loss activated at Epoch {epoch+1}")
                     steps_since_l2_loss_activated = 0
-                    activated_epoch = epoch
             else:
                 steps_since_l2_loss_activated += 1
         
@@ -367,9 +380,16 @@ def train_stegastamp(args, accelerator, save_dir):
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
-        if (epoch + 1) % args.save_image_interval == 0:
-            evaluate_stegastamp(args, test_dataloader, accelerator, encoder, decoder, save_dir, epoch, global_step)
-            
+        if epoch == 0 or epoch == (max_epochs-1) or (epoch + 1) % args.save_image_interval == 0:
+            evaluate_stegastamp(args, accelerator, encoder, decoder, save_dir, epoch, global_step)
+            # Save encoder checkpoint
+            if accelerator.is_main_process:
+                ckpt_dir = os.path.join(save_dir, "ckpt")
+                os.makedirs(ckpt_dir, exist_ok=True)
+                encoder = accelerator.unwrap_model(encoder)
+                torch.save(encoder.state_dict(), os.path.join(ckpt_dir, f"encoder_epoch_{epoch+1}.pt"))
+                decoder = accelerator.unwrap_model(decoder)
+                torch.save(decoder.state_dict(), os.path.join(ckpt_dir, f"decoder_epoch_{epoch+1}.pt"))
         # if activated_epoch is not None and (epoch - activated_epoch + 1) >= 30:
         #     print(f"Training stopped after 30 epochs post lpips activation at epoch {epoch+1}")
         #     break

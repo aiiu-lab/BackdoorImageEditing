@@ -6,10 +6,10 @@ from transformers import AutoTokenizer, CLIPTextModel
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from peft import LoraConfig
 from huggingface_hub import PyTorchModelHubMixin
-from stega_encoder_decoder import ConditionAdaptor
+from .stega_encoder_decoder import ConditionAdaptor
 p = "src/"
 sys.path.append(p)
-from model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, download_url
+from .model import make_1step_sched, my_vae_encoder_fwd, my_vae_decoder_fwd, download_url
 
 
 class VAE_encode(nn.Module):
@@ -218,7 +218,17 @@ class VINE_Turbo(torch.nn.Module, PyTorchModelHubMixin):
         B = x.shape[0]
         x_sec = self.sec_encoder(secret, x)
         x_enc = self.vae_enc(x_sec, direction="a2b").to(x.dtype)
-        model_pred = self.unet(x_enc, self.timesteps, encoder_hidden_states=self.fixed_a2b_emb_base,).sample.to(x.dtype)
-        x_out = torch.stack([self.sched.step(model_pred[i], self.timesteps[i], x_enc[i], return_dict=True).prev_sample for i in range(B)])
+        ### added block
+        # 將固定的文字嵌入複製 B 次，變成 (B, seq_len, hidden_size)
+        cond = self.fixed_a2b_emb_base.repeat(B, 1, 1)
+        # 如果 timesteps 為單一值，也需要展開成批次大小
+        ts = self.timesteps.expand(B)
+        model_pred = self.unet(x_enc, ts, encoder_hidden_states=cond).sample.to(x.dtype)
+        B = x.shape[0]
+        x_out = torch.stack([self.sched.step(model_pred[i], ts[i], x_enc[i], return_dict=True).prev_sample for i in range(B)])
+        ### end of added block
+        
+        # model_pred = self.unet(x_enc, self.timesteps, encoder_hidden_states=self.fixed_a2b_emb_base,).sample.to(x.dtype)
+        # x_out = torch.stack([self.sched.step(model_pred[i], self.timesteps[i], x_enc[i], return_dict=True).prev_sample for i in range(B)])
         x_out_decoded = self.vae_dec(x_out, direction="a2b").to(x.dtype)
         return x_out_decoded
