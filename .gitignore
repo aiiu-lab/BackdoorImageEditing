@@ -12,7 +12,7 @@ VINE/__pycache__/*
 #dir
 plot/*
 evaluate/*
-src/taming-transformers/*
+src/*
 
 ## output_dir
 ckpt/*
