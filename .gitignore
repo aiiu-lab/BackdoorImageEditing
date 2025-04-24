@@ -13,11 +13,12 @@ VINE/__pycache__/*
 plot/*
 evaluate/*
 src/*
+data/*
+
 
 ## output_dir
 ckpt/*
 results/*
-FixedPattern_instruct-pix2pix-model/*
 instruct-pix2pix-model/*
 stega_instruct-pix2pix-model/*
 VINE-B_instruct-pix2pix-model/*

@@ -8,6 +8,40 @@ from typing import Tuple, Union
 from util import normalize
 from typing import Union
 from PIL import Image
+import os
+
+class MIRFLICKR_ImageDataset(Dataset):
+    def __init__(self, image_dir, image_resolution=256):
+        """
+        Args:
+            image_dir (str): Root directory with subfolders (0,1,...,9) containing .jpg images.
+            image_resolution (int): Target resolution for resizing.
+        """
+        self.image_dir = image_dir
+        # Recursively find all .jpg files
+        self.image_paths = [
+            os.path.join(root, fname)
+            for root, _, files in os.walk(image_dir)
+            for fname in files
+            if fname.lower().endswith(".jpg")
+        ]
+        self.transform = transforms.Compose([
+            transforms.Resize((image_resolution, image_resolution)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])  # normalize to [-1, 1]
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image_path = self.image_paths[idx]
+        image = Image.open(image_path).convert("RGB")
+        image = self.transform(image)
+        return {
+            "original_pixel_values": image
+        }
+
 
 
 class InstructPix2PixDataset(Dataset):
