@@ -11,7 +11,10 @@ VINE/__pycache__/*
 
 #dir
 plot/*
-evaluate/*
+evaluate/visualize*
+evaluate/evaluate_clean_model.py
+models/*Net.py
+*_watermarking.py
 src/*
 data/*
 
@@ -30,3 +33,4 @@ quality_results_check/*
 
 # file
 ViT-L-14.pt
+badedit.py
