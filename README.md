@@ -31,9 +31,9 @@ pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https
 pip install -r requirements.txt
 ```
 
-## Training (Take RoSteALS as Example)
+## Training 
 
-Download the official RoSteALS checkpoint in their official [repo](https://github.com/TuBui/RoSteALS) and put them in to the folder structure as follows:
+Taking RoSteALS as an example, download the official RoSteALS checkpoint in their official [repo](https://github.com/TuBui/RoSteALS) and put them in to the folder structure as follows:
 
 ```
 BackdoorImageEditing/
@@ -75,14 +75,14 @@ The StegaStamp checkpoint can be accessed through the [link](https://drive.googl
 
 
 
-## examples
+## Demo
 We provide a simple example at [demo.ipynb](demo.ipynb). It walks you through watermark encoding and image editing for original samples and watermarked samples.
 
 
 
 
 ## Acknowledgement
-We thank the following contributors that our code are based on: [Diffusers](https://github.com/huggingface/diffusers), [VINE](https://github.com/Shilin-LU/VINE/tree/main), [RoSteALS](https://github.com/TuBui/RoSteALS), [ArtificialGAN](https://github.com/ningyu1991/ArtificialGANFingerprints/tree/main).
+We thank the following contributors that our code are based on: [Diffusers](https://github.com/huggingface/diffusers), [InstructPix2Pix](https://github.com/timothybrooks/instruct-pix2pix), [VINE](https://github.com/Shilin-LU/VINE/tree/main), [RoSteALS](https://github.com/TuBui/RoSteALS), [ArtificialGAN](https://github.com/ningyu1991/ArtificialGANFingerprints/tree/main).
 
 
 
