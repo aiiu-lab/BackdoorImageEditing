@@ -1,0 +1,13 @@
+name: badedit
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+  - conda-forge
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - python=3.8.12
+  - pip:
+      - pip==24.0
+      

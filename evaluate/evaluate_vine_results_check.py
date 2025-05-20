@@ -344,8 +344,7 @@ def parse_args():
                         help="Number of backdoor targets to use. Each target will be assigned a backdoor rate equal to --backdoor_rate.")
     parser.add_argument("--backdoor_rate", type=float, default=0.1, help="The rate of backdoor watermarking.")
 
-    # parser.add_argument("--encoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/encoder_no_noisel", help="Path to the encoder model.")
-    # parser.add_argument("--decoder_path", type=str, default="/scratch3/users/yufeng/Myproj/checkpoints/decoder_no_noiselayer_high_quality_high_bitacc.pt", help="Path to the decoder model.")
+
     # Rosteals
     parser.add_argument("--secret_length", type=int, default=100, help="Length of the secret bit string (e.g. 100).")
 

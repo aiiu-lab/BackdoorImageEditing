@@ -1,0 +1,20 @@
+wandb==0.19.1
+accelerate==0.26.0
+datasets==3.1.0
+pillow==10.4.0
+transformers==4.46.3
+lpips==0.1.4
+diffusers==0.33.0
+matplotlib==3.7.5
+comet-ml==3.47.6
+omegaconf==2.3.0
+scikit-image==0.21.0
+openai-clip==1.0.1
+einops==0.8.1
+pytorch-lightning==1.6.5
+kornia==0.7.3
+-e git+https://github.com/CompVis/taming-transformers.git@3ba01b241669f5ade541ce990f7650a3b8f65318#egg=taming_transformers
+opencv-python==3.4.18.65
+slackclient==2.9.3
+imagenet-c==0.0.3
+peft==0.13.2

@@ -48,7 +48,7 @@ def parse_args():
     
     # training config
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=1, help="Max Number of training epochs") # 18
+    parser.add_argument("--epochs", type=int, default=1, help="Max Number of training epochs") 
     parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate for the optimizer")
     parser.add_argument("--image_resolution", type=int, default=256, help="Resolution of the images")
     parser.add_argument("--watermark_bits", type=int, default=100, help="Length of the random bit sequence for watermark")

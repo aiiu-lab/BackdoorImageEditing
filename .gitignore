@@ -1,7 +1,6 @@
 runs/*
 __pycache__/*
 data/*
-*.ipynb
 models/__pycache__/*
 checkpoints/*
 VINE/__pycache__/*
@@ -34,3 +33,4 @@ quality_results_check/*
 # file
 ViT-L-14.pt
 badedit.py
+test.ipynb

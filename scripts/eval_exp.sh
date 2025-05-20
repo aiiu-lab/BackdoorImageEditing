@@ -26,8 +26,8 @@ python ./evaluate/evaluate_stega_results_check.py --ckpt_path "./stega_instruct-
 # CUDA_VISIBLE_DEVICES=1 python ./evaluate/evaluate_stega_results_check.py --ckpt_path "./stega_instruct-pix2pix-model/runs/Multi1_Stega_bad_0.1_img_2025-04-05_18-02/ckpt_epoch_48"
 
 # ablation study (backdoor_target_num)
-python ./evaluate/evaluate_stega_results_check.py --backdoor_target_num 2 --ckpt_path "/scratch3/users/yufeng/Myproj/stega_instruct-pix2pix-model/runs/Multi2_Stega_bad_0.1_combined_2025-04-06_11-07/ckpt_epoch_35"
-python ./evaluate/evaluate_stega_results_check.py --backdoor_target_num 4 --ckpt_path "/scratch3/users/yufeng/Myproj/stega_instruct-pix2pix-model/runs/Multi4_Stega_bad_0.1_combined_2025-04-06_16-52/ckpt_epoch_47"
+python ./evaluate/evaluate_stega_results_check.py --backdoor_target_num 2 --ckpt_path "./stega_instruct-pix2pix-model/runs/Multi2_Stega_bad_0.1_combined_2025-04-06_11-07/ckpt_epoch_35"
+python ./evaluate/evaluate_stega_results_check.py --backdoor_target_num 4 --ckpt_path "./stega_instruct-pix2pix-model/runs/Multi4_Stega_bad_0.1_combined_2025-04-06_16-52/ckpt_epoch_47"
 
 # VINE
 python ./evaluate/evaluate_vine_results_check.py --ckpt_path "./VINE-B_instruct-pix2pix-model/runs/Multi1_VINE_bad_0.1_combined_2025-04-05_23-47/ckpt_epoch_37"
