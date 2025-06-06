@@ -9,7 +9,7 @@ Pin-Yen Chiu,
 
 Research Center for Information Technology Innovation, Academia Sinica
 
-####  [Paper]() | [arXiv]() 
+#### [arXiv](http://arxiv.org/abs/2506.04879) 
 
 ![teaser](assets/teaser.png)
 
@@ -85,10 +85,3 @@ We provide a simple example at [demo.ipynb](demo.ipynb). It walks you through wa
 We thank the following contributors that our code are based on: [Diffusers](https://github.com/huggingface/diffusers), [InstructPix2Pix](https://github.com/timothybrooks/instruct-pix2pix), [VINE](https://github.com/Shilin-LU/VINE/tree/main), [RoSteALS](https://github.com/TuBui/RoSteALS), [ArtificialGAN](https://github.com/ningyu1991/ArtificialGANFingerprints/tree/main).
 
 
-
-### Citation
-If you find our work useful, please consider cite this work as
-```bibtex
-@inproceedings{
-}
-```
