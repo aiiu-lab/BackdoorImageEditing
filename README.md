@@ -60,10 +60,6 @@ accelerate launch ros_badedit.py --backdoor_target_num 1 --backdoor_rate 0.1 --l
 For more training settings, please refer to the [scripts](scripts/exp.sh).
 
 
-The backdoor model checkpoint can be accessed through the [link](https://drive.google.com/drive/folders/1C2Ad7x232H8spw6V11TOrWsrVtfzdN_x?usp=sharing).
-
-
-
 ### StegaStamp
 To train StegaStamp encoder and decoder, you need to download the dataset to your local directory. we align the training dataset used in [RoSteALS](https://github.com/TuBui/RoSteALS) for a fair comparison and run the command.
 ```
@@ -72,12 +68,13 @@ python train_stega_wm_encoder_decoder.py
 The StegaStamp checkpoint can be accessed through the [link](https://drive.google.com/drive/folders/1s0_30UMl55C55tvNLCxYLJ_XGaMmu9yq?usp=sharing).
 
 
+The backdoor model checkpoints are available on [HuggingFace](https://huggingface.co/yufengcccc).
+Please feel free to download them.
 
 
 
-## Demo
+### Demo
 We provide a simple example at [demo.ipynb](demo.ipynb). It walks you through watermark encoding and image editing for original samples and watermarked samples.
-
 
 
 
